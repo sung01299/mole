@@ -1,7 +1,7 @@
 # Mole
 
 <p align="center">
-  <img src="mole-logo.png" alt="Mole" width="200">
+  <img src="mole-logo.png" alt="Mole" width="400">
 </p>
 
 > The missing TUI for ngrok
