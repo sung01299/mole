@@ -1,6 +1,9 @@
 package ngrok
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // GetTunnels retrieves all active tunnels
 func (c *Client) GetTunnels() ([]Tunnel, error) {
@@ -37,10 +40,10 @@ func (c *Client) GetRequest(id string) (*Request, error) {
 }
 
 // Replay re-sends a captured request
-// target: optional override for the target address (empty string uses original)
-func (c *Client) Replay(id string) error {
-	path := fmt.Sprintf("/api/requests/http/%s/replay", id)
-	return c.post(path)
+// ngrok v3 API: POST /api/requests/http with body {"id": "request_id"}
+func (c *Client) Replay(requestID string) error {
+	body := fmt.Sprintf(`{"id":"%s"}`, requestID)
+	return c.post("/api/requests/http", strings.NewReader(body))
 }
 
 // DeleteRequests clears all captured requests

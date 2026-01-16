@@ -67,8 +67,7 @@ var (
 	// List styles
 	ListTitleStyle = lipgloss.NewStyle().
 			Foreground(ColorPrimary).
-			Bold(true).
-			Padding(0, 1)
+			Bold(true)
 
 	SelectedItemStyle = lipgloss.NewStyle().
 				Background(ColorHighlight).
@@ -79,8 +78,7 @@ var (
 
 	// Method badge style
 	MethodStyle = lipgloss.NewStyle().
-			Bold(true).
-			Padding(0, 1)
+			Bold(true)
 
 	// Status code style
 	StatusStyle = lipgloss.NewStyle().
@@ -97,8 +95,7 @@ var (
 	// Detail panel styles
 	DetailTitleStyle = lipgloss.NewStyle().
 				Foreground(ColorPrimary).
-				Bold(true).
-				Padding(0, 1)
+				Bold(true)
 
 	DetailLabelStyle = lipgloss.NewStyle().
 				Foreground(ColorMuted)
@@ -106,14 +103,16 @@ var (
 	DetailValueStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#FFFFFF"))
 
-	// Border styles
+	// Border styles with consistent padding
 	BorderStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorBorder)
+			BorderForeground(ColorBorder).
+			Padding(0, 1)
 
 	ActiveBorderStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(ColorPrimary)
+				BorderForeground(ColorPrimary).
+				Padding(0, 1)
 
 	// Help/Footer styles
 	HelpStyle = lipgloss.NewStyle().

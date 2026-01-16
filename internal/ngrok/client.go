@@ -53,21 +53,29 @@ func (c *Client) get(path string, result interface{}) error {
 	return nil
 }
 
-// post performs a POST request
-func (c *Client) post(path string) error {
+// post performs a POST request with optional JSON body
+func (c *Client) post(path string, body io.Reader) error {
 	url := c.baseURL + path
-	resp, err := c.httpClient.Post(url, "application/json", nil)
+
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return fmt.Errorf("POST %s: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("POST %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, string(body))
+	// Accept 200, 201, 204 as success
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
 	}
 
-	return nil
+	respBody, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, string(respBody))
 }
 
 // IsAvailable checks if the ngrok API is reachable

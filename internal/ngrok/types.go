@@ -1,6 +1,10 @@
 package ngrok
 
-import "time"
+import (
+	"encoding/base64"
+	"strings"
+	"time"
+)
 
 // Tunnel represents an ngrok tunnel
 type Tunnel struct {
@@ -56,11 +60,45 @@ type Request struct {
 
 // HTTPData represents HTTP request or response data
 type HTTPData struct {
-	Method  string              `json:"method,omitempty"`
-	Proto   string              `json:"proto"`
-	Headers map[string][]string `json:"headers"`
-	URI     string              `json:"uri,omitempty"`
-	Raw     string              `json:"raw"`
+	Method     string              `json:"method,omitempty"`
+	Proto      string              `json:"proto"`
+	Headers    map[string][]string `json:"headers"`
+	URI        string              `json:"uri,omitempty"`
+	Raw        string              `json:"raw"`
+	StatusCode int                 `json:"status_code,omitempty"` // For response
+	Status     string              `json:"status,omitempty"`      // e.g., "200 OK"
+}
+
+// DecodeBody decodes the base64-encoded raw field and extracts the body
+func (h *HTTPData) DecodeBody() string {
+	if h.Raw == "" {
+		return ""
+	}
+
+	// Decode base64
+	decoded, err := base64.StdEncoding.DecodeString(h.Raw)
+	if err != nil {
+		// Try URL-safe base64
+		decoded, err = base64.URLEncoding.DecodeString(h.Raw)
+		if err != nil {
+			return h.Raw // Return as-is if not base64
+		}
+	}
+
+	raw := string(decoded)
+
+	// The raw contains full HTTP message (headers + body)
+	// Find the empty line that separates headers from body
+	headerEnd := strings.Index(raw, "\r\n\r\n")
+	if headerEnd == -1 {
+		headerEnd = strings.Index(raw, "\n\n")
+		if headerEnd == -1 {
+			return raw // No body separator found, return full content
+		}
+		return strings.TrimSpace(raw[headerEnd+2:])
+	}
+
+	return strings.TrimSpace(raw[headerEnd+4:])
 }
 
 // RequestsResponse is the response from GET /api/requests/http
@@ -75,18 +113,64 @@ type ReplayRequest struct {
 	Target string `json:"target,omitempty"` // optional: override target address
 }
 
-// StatusCode extracts the numeric status code from ResponseStatus
+// StatusCode extracts the numeric status code
 func (r *Request) StatusCode() int {
-	if len(r.ResponseStatus) < 3 {
-		return 0
+	// Try Response.StatusCode first (ngrok API v2)
+	if r.Response.StatusCode > 0 {
+		return r.Response.StatusCode
 	}
-	code := 0
-	for i := 0; i < 3 && i < len(r.ResponseStatus); i++ {
-		if r.ResponseStatus[i] >= '0' && r.ResponseStatus[i] <= '9' {
-			code = code*10 + int(r.ResponseStatus[i]-'0')
+
+	// Try parsing from ResponseStatus (e.g., "200 OK")
+	if len(r.ResponseStatus) >= 3 {
+		code := 0
+		for i := 0; i < 3 && i < len(r.ResponseStatus); i++ {
+			if r.ResponseStatus[i] >= '0' && r.ResponseStatus[i] <= '9' {
+				code = code*10 + int(r.ResponseStatus[i]-'0')
+			}
+		}
+		if code > 0 {
+			return code
 		}
 	}
-	return code
+
+	// Try parsing from Response.Status (e.g., "200 OK")
+	if len(r.Response.Status) >= 3 {
+		code := 0
+		for i := 0; i < 3 && i < len(r.Response.Status); i++ {
+			if r.Response.Status[i] >= '0' && r.Response.Status[i] <= '9' {
+				code = code*10 + int(r.Response.Status[i]-'0')
+			}
+		}
+		if code > 0 {
+			return code
+		}
+	}
+
+	// Try to extract from raw response (first line like "HTTP/1.1 200 OK")
+	if r.Response.Raw != "" {
+		decoded, err := base64.StdEncoding.DecodeString(r.Response.Raw)
+		if err == nil {
+			line := string(decoded)
+			if idx := strings.Index(line, "\n"); idx > 0 {
+				line = line[:idx]
+			}
+			// Parse "HTTP/1.1 200 OK"
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) >= 2 {
+				code := 0
+				for _, c := range parts[1] {
+					if c >= '0' && c <= '9' {
+						code = code*10 + int(c-'0')
+					}
+				}
+				if code > 0 {
+					return code
+				}
+			}
+		}
+	}
+
+	return 0
 }
 
 // DurationMs returns the duration in milliseconds

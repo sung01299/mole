@@ -38,3 +38,8 @@ type WindowFocusMsg struct {
 type ErrorMsg struct {
 	Err error
 }
+
+// CopyMsg indicates the result of a copy to clipboard action
+type CopyMsg struct {
+	Success bool
+}

@@ -2,6 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"os/exec"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,9 +25,40 @@ type FocusState int
 
 const (
 	FocusList FocusState = iota
-	FocusDetail
-	FocusSidebar
+	FocusDetailPanel // Detail panel in split view (scrollable)
+	FocusSearch      // Search input mode
+	FocusFilter      // Filter mode
 )
+
+// FilterStep represents the current step in filter creation
+type FilterStep int
+
+const (
+	FilterStepField FilterStep = iota
+	FilterStepOperator
+	FilterStepValue
+)
+
+// Filter represents an active filter
+type Filter struct {
+	Field    string
+	Operator string
+	Value    string
+}
+
+// FilterField defines a filterable field
+type FilterField struct {
+	Name      string
+	Key       string
+	Operators []string
+}
+
+var filterFields = []FilterField{
+	{Name: "Status Code", Key: "status", Operators: []string{"=", "!=", ">", "<", ">=", "<="}},
+	{Name: "Method", Key: "method", Operators: []string{"=", "!="}},
+	{Name: "Path", Key: "path", Operators: []string{"contains", "=", "starts", "ends"}},
+	{Name: "Duration (ms)", Key: "duration", Operators: []string{"=", ">", "<", ">=", "<="}},
+}
 
 // Polling intervals
 const (
@@ -38,18 +73,34 @@ type App struct {
 	height int
 
 	// Focus state
-	focus FocusState
+	focus     FocusState
+	prevFocus FocusState // To restore after search/filter
 
 	// Data
-	tunnels   []ngrok.Tunnel
-	requests  []ngrok.Request
-	selected  int
-	lastError error
+	tunnels        []ngrok.Tunnel
+	requests       []ngrok.Request
+	filteredReqs   []ngrok.Request // Filtered requests for display
+	selected       int
+	lastError      error
+	lastSelectedID string // Track selected request ID for viewport updates
+
+	// Search (full-text with highlighting)
+	searchQuery  string
+	searchCursor int
+
+	// Filter (field-based conditions)
+	filterStep     FilterStep
+	filterInput    string
+	filterCursor   int
+	filterSelected int              // Selected item in field/operator list
+	activeFilters  []Filter         // Currently active filters
+	pendingFilter  Filter           // Filter being created
+	filteredFields []FilterField    // Filtered field list based on input
 
 	// Components
-	viewport viewport.Model
-	spinner  spinner.Model
-	keys     KeyMap
+	detailViewport viewport.Model // For detail panel scrolling
+	spinner        spinner.Model
+	keys           KeyMap
 
 	// API client
 	client *ngrok.Client
@@ -102,6 +153,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.height = msg.Height
 		a.updateViewportSize()
 		a.ready = true
+		// Force update of detail viewport on resize
+		a.lastSelectedID = ""
+		a.updateDetailViewport()
 
 	case messages.TickMsg:
 		interval := ActivePollingInterval
@@ -127,15 +181,26 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Preserve selection if possible
 			oldLen := len(a.requests)
 			a.requests = msg.Requests
-			if a.selected >= len(a.requests) {
-				a.selected = max(0, len(a.requests)-1)
+			// Apply current filters
+			a.applyFilters()
+			if a.selected >= len(a.filteredReqs) {
+				a.selected = max(0, len(a.filteredReqs)-1)
 			}
 			// Update detail view if we have new data
-			if len(a.requests) != oldLen && a.focus == FocusDetail {
-				a.updateDetailContent()
+			if len(a.requests) != oldLen {
+				a.updateDetailViewport()
 			}
 			a.lastError = nil
 		}
+
+	case messages.CopyMsg:
+		if msg.Success {
+			a.lastError = nil
+			// Show brief success message (will be cleared on next action)
+		}
+
+	case messages.ErrorMsg:
+		a.lastError = msg.Err
 
 	case messages.ReplayMsg:
 		if msg.Err != nil {
@@ -151,10 +216,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 	}
 
-	// Update viewport if in detail mode
-	if a.focus == FocusDetail {
+	// Update detail viewport when focused
+	if a.focus == FocusDetailPanel {
 		var cmd tea.Cmd
-		a.viewport, cmd = a.viewport.Update(msg)
+		a.detailViewport, cmd = a.detailViewport.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 
@@ -163,48 +228,582 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKeyPress processes key events
 func (a *App) handleKeyPress(msg tea.KeyMsg) tea.Cmd {
+	// Handle search mode input
+	if a.focus == FocusSearch {
+		return a.handleSearchInput(msg)
+	}
+
+	// Handle filter mode input
+	if a.focus == FocusFilter {
+		return a.handleFilterInput(msg)
+	}
+
 	switch {
 	case key.Matches(msg, a.keys.Quit):
 		return tea.Quit
 
+	case key.Matches(msg, a.keys.Search):
+		a.prevFocus = a.focus
+		a.focus = FocusSearch
+		a.searchCursor = len(a.searchQuery)
+		return nil
+
+	case key.Matches(msg, a.keys.Filter):
+		a.prevFocus = a.focus
+		a.focus = FocusFilter
+		a.filterStep = FilterStepField
+		a.filterInput = ""
+		a.filterCursor = 0
+		a.filterSelected = 0
+		a.filteredFields = filterFields
+		return nil
+
+	case key.Matches(msg, a.keys.Clear):
+		a.clearAll()
+		return nil
+
+	case key.Matches(msg, a.keys.Copy):
+		if len(a.filteredReqs) > 0 && a.selected < len(a.filteredReqs) {
+			return a.copyAsCurl(a.filteredReqs[a.selected])
+		}
+
 	case key.Matches(msg, a.keys.Down):
-		if a.focus == FocusList && len(a.requests) > 0 {
-			a.selected = min(a.selected+1, len(a.requests)-1)
+		if a.focus == FocusList {
+			if len(a.filteredReqs) > 0 {
+				a.selected = min(a.selected+1, len(a.filteredReqs)-1)
+				a.updateDetailViewport()
+			}
+		} else if a.focus == FocusDetailPanel {
+			a.detailViewport.LineDown(1)
 		}
 
 	case key.Matches(msg, a.keys.Up):
-		if a.focus == FocusList && len(a.requests) > 0 {
-			a.selected = max(a.selected-1, 0)
+		if a.focus == FocusList {
+			if len(a.filteredReqs) > 0 {
+				a.selected = max(a.selected-1, 0)
+				a.updateDetailViewport()
+			}
+		} else if a.focus == FocusDetailPanel {
+			a.detailViewport.LineUp(1)
 		}
 
 	case key.Matches(msg, a.keys.Top):
 		if a.focus == FocusList {
 			a.selected = 0
+			a.updateDetailViewport()
+		} else if a.focus == FocusDetailPanel {
+			a.detailViewport.GotoTop()
 		}
 
 	case key.Matches(msg, a.keys.Bottom):
-		if a.focus == FocusList && len(a.requests) > 0 {
-			a.selected = len(a.requests) - 1
-		}
-
-	case key.Matches(msg, a.keys.Enter):
-		if a.focus == FocusList && len(a.requests) > 0 {
-			a.focus = FocusDetail
-			a.updateDetailContent()
+		if a.focus == FocusList && len(a.filteredReqs) > 0 {
+			a.selected = len(a.filteredReqs) - 1
+			a.updateDetailViewport()
+		} else if a.focus == FocusDetailPanel {
+			a.detailViewport.GotoBottom()
 		}
 
 	case key.Matches(msg, a.keys.Escape):
-		if a.focus == FocusDetail {
+		if a.searchQuery != "" || len(a.activeFilters) > 0 {
+			a.clearAll()
+		} else if a.focus == FocusDetailPanel {
+			a.focus = FocusList
+		}
+
+	case key.Matches(msg, a.keys.Toggle):
+		if a.focus == FocusList {
+			a.focus = FocusDetailPanel
+		} else {
 			a.focus = FocusList
 		}
 
 	case key.Matches(msg, a.keys.Replay):
-		if len(a.requests) > 0 && a.selected < len(a.requests) {
-			return a.replayRequest(a.requests[a.selected].ID)
+		if len(a.filteredReqs) > 0 && a.selected < len(a.filteredReqs) {
+			return a.replayRequest(a.filteredReqs[a.selected].ID)
 		}
 	}
 
 	return nil
+}
+
+// handleSearchInput handles keyboard input in search mode
+func (a *App) handleSearchInput(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEnter:
+		a.focus = a.prevFocus
+		a.performSearch()
+		return nil
+
+	case tea.KeyEscape:
+		a.focus = a.prevFocus
+		// Clear search completely
+		a.searchQuery = ""
+		a.searchCursor = 0
+		// Reset to show all requests (respecting active filters)
+		a.applyFilters()
+		return nil
+
+	case tea.KeyBackspace:
+		if len(a.searchQuery) > 0 && a.searchCursor > 0 {
+			a.searchQuery = a.searchQuery[:a.searchCursor-1] + a.searchQuery[a.searchCursor:]
+			a.searchCursor--
+		}
+		return nil
+
+	case tea.KeyLeft:
+		if a.searchCursor > 0 {
+			a.searchCursor--
+		}
+		return nil
+
+	case tea.KeyRight:
+		if a.searchCursor < len(a.searchQuery) {
+			a.searchCursor++
+		}
+		return nil
+
+	case tea.KeyRunes:
+		char := string(msg.Runes)
+		a.searchQuery = a.searchQuery[:a.searchCursor] + char + a.searchQuery[a.searchCursor:]
+		a.searchCursor += len(char)
+		return nil
+	}
+	return nil
+}
+
+// handleFilterInput handles keyboard input in filter mode
+func (a *App) handleFilterInput(msg tea.KeyMsg) tea.Cmd {
+	switch a.filterStep {
+	case FilterStepField:
+		return a.handleFilterFieldInput(msg)
+	case FilterStepOperator:
+		return a.handleFilterOperatorInput(msg)
+	case FilterStepValue:
+		return a.handleFilterValueInput(msg)
+	}
+	return nil
+}
+
+func (a *App) handleFilterFieldInput(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.focus = a.prevFocus
+		a.filterInput = ""
+		return nil
+
+	case tea.KeyEnter:
+		if len(a.filteredFields) > 0 && a.filterSelected < len(a.filteredFields) {
+			a.pendingFilter.Field = a.filteredFields[a.filterSelected].Key
+			a.filterStep = FilterStepOperator
+			a.filterSelected = 0
+			a.filterInput = ""
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.filterSelected > 0 {
+			a.filterSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.filterSelected < len(a.filteredFields)-1 {
+			a.filterSelected++
+		}
+		return nil
+
+	case tea.KeyBackspace:
+		if len(a.filterInput) > 0 {
+			a.filterInput = a.filterInput[:len(a.filterInput)-1]
+			a.updateFilteredFields()
+		}
+		return nil
+
+	case tea.KeyRunes:
+		a.filterInput += string(msg.Runes)
+		a.updateFilteredFields()
+		a.filterSelected = 0
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleFilterOperatorInput(msg tea.KeyMsg) tea.Cmd {
+	field := a.getFieldByKey(a.pendingFilter.Field)
+	if field == nil {
+		return nil
+	}
+
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.filterStep = FilterStepField
+		a.filterSelected = 0
+		a.updateFilteredFields()
+		return nil
+
+	case tea.KeyEnter:
+		if a.filterSelected < len(field.Operators) {
+			a.pendingFilter.Operator = field.Operators[a.filterSelected]
+			a.filterStep = FilterStepValue
+			a.filterInput = ""
+			a.filterCursor = 0
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.filterSelected > 0 {
+			a.filterSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.filterSelected < len(field.Operators)-1 {
+			a.filterSelected++
+		}
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleFilterValueInput(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.filterStep = FilterStepOperator
+		a.filterSelected = 0
+		return nil
+
+	case tea.KeyEnter:
+		if a.filterInput != "" {
+			a.pendingFilter.Value = a.filterInput
+			a.activeFilters = append(a.activeFilters, a.pendingFilter)
+			a.pendingFilter = Filter{}
+			a.filterInput = ""
+			a.focus = a.prevFocus
+			a.applyFilters()
+		}
+		return nil
+
+	case tea.KeyBackspace:
+		if len(a.filterInput) > 0 && a.filterCursor > 0 {
+			a.filterInput = a.filterInput[:a.filterCursor-1] + a.filterInput[a.filterCursor:]
+			a.filterCursor--
+		}
+		return nil
+
+	case tea.KeyLeft:
+		if a.filterCursor > 0 {
+			a.filterCursor--
+		}
+		return nil
+
+	case tea.KeyRight:
+		if a.filterCursor < len(a.filterInput) {
+			a.filterCursor++
+		}
+		return nil
+
+	case tea.KeyRunes:
+		char := string(msg.Runes)
+		a.filterInput = a.filterInput[:a.filterCursor] + char + a.filterInput[a.filterCursor:]
+		a.filterCursor += len(char)
+		return nil
+	}
+	return nil
+}
+
+func (a *App) updateFilteredFields() {
+	if a.filterInput == "" {
+		a.filteredFields = filterFields
+		return
+	}
+	query := strings.ToLower(a.filterInput)
+	a.filteredFields = nil
+	for _, f := range filterFields {
+		if strings.Contains(strings.ToLower(f.Name), query) ||
+			strings.Contains(strings.ToLower(f.Key), query) {
+			a.filteredFields = append(a.filteredFields, f)
+		}
+	}
+}
+
+func (a *App) getFieldByKey(key string) *FilterField {
+	for _, f := range filterFields {
+		if f.Key == key {
+			return &f
+		}
+	}
+	return nil
+}
+
+// performSearch searches across all requests and filters to matching ones
+func (a *App) performSearch() {
+	if a.searchQuery == "" {
+		// Re-apply filters without search
+		a.applyFilters()
+		return
+	}
+
+	query := strings.ToLower(a.searchQuery)
+
+	// First, filter requests to only those that match
+	var matchingReqs []ngrok.Request
+	matchedIDs := make(map[string]bool)
+
+	// Get base filtered requests (from activeFilters)
+	baseReqs := a.requests
+	if len(a.activeFilters) > 0 {
+		baseReqs = nil
+		for _, req := range a.requests {
+			if a.matchesAllFilters(req) {
+				baseReqs = append(baseReqs, req)
+			}
+		}
+	}
+
+	for _, req := range baseReqs {
+		matched := false
+
+		// Search in method
+		if strings.Contains(strings.ToLower(req.Request.Method), query) {
+			matched = true
+		}
+		// Search in path
+		if strings.Contains(strings.ToLower(req.Request.URI), query) {
+			matched = true
+		}
+		// Search in status
+		if strings.Contains(fmt.Sprintf("%d", req.StatusCode()), query) {
+			matched = true
+		}
+		// Search in headers
+		for k, vals := range req.Request.Headers {
+			for _, v := range vals {
+				if strings.Contains(strings.ToLower(k+": "+v), query) {
+					matched = true
+				}
+			}
+		}
+		for k, vals := range req.Response.Headers {
+			for _, v := range vals {
+				if strings.Contains(strings.ToLower(k+": "+v), query) {
+					matched = true
+				}
+			}
+		}
+		// Search in body
+		reqBody := req.Request.DecodeBody()
+		if strings.Contains(strings.ToLower(reqBody), query) {
+			matched = true
+		}
+		respBody := req.Response.DecodeBody()
+		if strings.Contains(strings.ToLower(respBody), query) {
+			matched = true
+		}
+
+		if matched && !matchedIDs[req.ID] {
+			matchingReqs = append(matchingReqs, req)
+			matchedIDs[req.ID] = true
+		}
+	}
+
+	a.filteredReqs = matchingReqs
+	a.selected = 0
+	a.updateDetailViewport()
+}
+
+// applyFilters applies all active filters to requests
+func (a *App) applyFilters() {
+	// Remember current selection by ID if possible
+	var selectedID string
+	if len(a.filteredReqs) > 0 && a.selected < len(a.filteredReqs) {
+		selectedID = a.filteredReqs[a.selected].ID
+	}
+
+	if len(a.activeFilters) == 0 {
+		a.filteredReqs = a.requests
+	} else {
+		var filtered []ngrok.Request
+		for _, req := range a.requests {
+			if a.matchesAllFilters(req) {
+				filtered = append(filtered, req)
+			}
+		}
+		a.filteredReqs = filtered
+	}
+
+	// Try to restore selection by ID
+	if selectedID != "" {
+		for i, req := range a.filteredReqs {
+			if req.ID == selectedID {
+				a.selected = i
+				a.updateDetailViewport()
+				return
+			}
+		}
+	}
+
+	// If not found, clamp selection
+	if a.selected >= len(a.filteredReqs) {
+		a.selected = max(0, len(a.filteredReqs)-1)
+	}
+	a.updateDetailViewport()
+}
+
+// matchesAllFilters checks if a request matches all active filters
+func (a *App) matchesAllFilters(req ngrok.Request) bool {
+	for _, f := range a.activeFilters {
+		if !a.matchesFilter(req, f) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchesFilter checks if a request matches a single filter
+func (a *App) matchesFilter(req ngrok.Request, f Filter) bool {
+	switch f.Field {
+	case "status":
+		return a.compareNumeric(req.StatusCode(), f.Operator, f.Value)
+	case "method":
+		return a.compareString(req.Request.Method, f.Operator, f.Value)
+	case "path":
+		return a.compareString(req.Request.URI, f.Operator, f.Value)
+	case "duration":
+		return a.compareFloat(req.DurationMs(), f.Operator, f.Value)
+	}
+	return true
+}
+
+func (a *App) compareNumeric(val int, op string, target string) bool {
+	t, err := strconv.Atoi(target)
+	if err != nil {
+		return false
+	}
+	switch op {
+	case "=":
+		return val == t
+	case "!=":
+		return val != t
+	case ">":
+		return val > t
+	case "<":
+		return val < t
+	case ">=":
+		return val >= t
+	case "<=":
+		return val <= t
+	}
+	return false
+}
+
+func (a *App) compareFloat(val float64, op string, target string) bool {
+	t, err := strconv.ParseFloat(target, 64)
+	if err != nil {
+		return false
+	}
+	switch op {
+	case "=":
+		return val == t
+	case ">":
+		return val > t
+	case "<":
+		return val < t
+	case ">=":
+		return val >= t
+	case "<=":
+		return val <= t
+	}
+	return false
+}
+
+func (a *App) compareString(val string, op string, target string) bool {
+	val = strings.ToLower(val)
+	target = strings.ToLower(target)
+	switch op {
+	case "=":
+		return val == target
+	case "!=":
+		return val != target
+	case "contains":
+		return strings.Contains(val, target)
+	case "starts":
+		return strings.HasPrefix(val, target)
+	case "ends":
+		return strings.HasSuffix(val, target)
+	}
+	return false
+}
+
+// clearAll clears search and all filters
+func (a *App) clearAll() {
+	a.searchQuery = ""
+	a.searchCursor = 0
+	a.activeFilters = nil
+	a.filteredReqs = a.requests
+	a.selected = 0
+	a.updateDetailViewport()
+}
+
+// copyAsCurl copies the request as a cURL command to clipboard
+func (a *App) copyAsCurl(req ngrok.Request) tea.Cmd {
+	return func() tea.Msg {
+		curl := buildCurlCommand(req)
+		
+		// Try to copy to clipboard using system command
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("pbcopy")
+		case "linux":
+			cmd = exec.Command("xclip", "-selection", "clipboard")
+		default:
+			return messages.ErrorMsg{Err: fmt.Errorf("clipboard not supported on %s", runtime.GOOS)}
+		}
+
+		cmd.Stdin = strings.NewReader(curl)
+		if err := cmd.Run(); err != nil {
+			return messages.ErrorMsg{Err: fmt.Errorf("failed to copy: %w", err)}
+		}
+
+		return messages.CopyMsg{Success: true}
+	}
+}
+
+// buildCurlCommand builds a cURL command string from a request
+func buildCurlCommand(req ngrok.Request) string {
+	var parts []string
+	parts = append(parts, "curl")
+
+	// Method
+	if req.Request.Method != "GET" {
+		parts = append(parts, "-X", req.Request.Method)
+	}
+
+	// Headers
+	for key, values := range req.Request.Headers {
+		// Skip some headers that curl handles automatically
+		if strings.ToLower(key) == "host" ||
+			strings.ToLower(key) == "content-length" ||
+			strings.HasPrefix(strings.ToLower(key), "x-forwarded") {
+			continue
+		}
+		for _, v := range values {
+			parts = append(parts, "-H", fmt.Sprintf("'%s: %s'", key, v))
+		}
+	}
+
+	// Body
+	body := req.Request.DecodeBody()
+	if body != "" {
+		// Escape single quotes in body
+		body = strings.ReplaceAll(body, "'", "'\\''")
+		parts = append(parts, "-d", fmt.Sprintf("'%s'", body))
+	}
+
+	// URL (use a placeholder since we don't have the full URL)
+	parts = append(parts, fmt.Sprintf("'<URL>%s'", req.Request.URI))
+
+	return strings.Join(parts, " ")
 }
 
 // View implements tea.Model
@@ -253,10 +852,6 @@ func (a *App) renderHeader() string {
 func (a *App) renderContent() string {
 	contentHeight := a.height - 4 // header + footer
 
-	if a.focus == FocusDetail {
-		return a.renderDetailFullscreen(contentHeight)
-	}
-
 	// Responsive layout
 	if a.width >= 120 {
 		return a.renderSideBySide(contentHeight)
@@ -266,34 +861,75 @@ func (a *App) renderContent() string {
 
 // renderSideBySide renders list and detail side by side
 func (a *App) renderSideBySide(height int) string {
-	listWidth := a.width / 2
+	// Give 30% to list, 70% to detail for more space to view request/response
+	listWidth := a.width * 30 / 100
+	if listWidth < 36 {
+		listWidth = 36
+	}
 	detailWidth := a.width - listWidth
 
-	list := a.renderRequestList(listWidth-2, height-2)
-	detail := a.renderDetailPanel(detailWidth-2, height-2)
+	// Content dimensions (subtract border=2 + padding=2 = 4)
+	listContentWidth := listWidth - 4
+	detailContentWidth := detailWidth - 4
+	contentHeight := height - 2 // border top + bottom
 
-	listBox := ActiveBorderStyle.Width(listWidth - 2).Height(height - 2).Render(list)
-	detailBox := BorderStyle.Width(detailWidth - 2).Height(height - 2).Render(detail)
+	list := a.renderRequestList(listContentWidth, contentHeight)
+	detail := a.renderDetailPanel(detailContentWidth, contentHeight)
+
+	// Highlight focused panel
+	listBorder := BorderStyle
+	detailBorder := BorderStyle
+	if a.focus == FocusList || a.focus == FocusFilter {
+		listBorder = ActiveBorderStyle
+	} else if a.focus == FocusDetailPanel {
+		detailBorder = ActiveBorderStyle
+	}
+
+	listBox := listBorder.Width(listContentWidth).Height(contentHeight).Render(list)
+	detailBox := detailBorder.Width(detailContentWidth).Height(contentHeight).Render(detail)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, listBox, detailBox)
 }
 
 // renderStacked renders list above detail
 func (a *App) renderStacked(height int) string {
-	listHeight := height * 60 / 100
+	// Give 40% to list, 60% to detail
+	listHeight := height * 40 / 100
+	if listHeight < 8 {
+		listHeight = 8
+	}
 	detailHeight := height - listHeight
 
-	list := a.renderRequestList(a.width-4, listHeight-2)
-	detail := a.renderDetailPanel(a.width-4, detailHeight-2)
+	// Content dimensions (subtract border=2 + padding=2 = 4)
+	contentWidth := a.width - 4
+	listContentHeight := listHeight - 2
+	detailContentHeight := detailHeight - 2
 
-	listBox := ActiveBorderStyle.Width(a.width - 4).Height(listHeight - 2).Render(list)
-	detailBox := BorderStyle.Width(a.width - 4).Height(detailHeight - 2).Render(detail)
+	list := a.renderRequestList(contentWidth, listContentHeight)
+	detail := a.renderDetailPanel(contentWidth, detailContentHeight)
+
+	// Highlight focused panel
+	listBorder := BorderStyle
+	detailBorder := BorderStyle
+	if a.focus == FocusList || a.focus == FocusFilter {
+		listBorder = ActiveBorderStyle
+	} else if a.focus == FocusDetailPanel {
+		detailBorder = ActiveBorderStyle
+	}
+
+	listBox := listBorder.Width(contentWidth).Height(listContentHeight).Render(list)
+	detailBox := detailBorder.Width(contentWidth).Height(detailContentHeight).Render(detail)
 
 	return lipgloss.JoinVertical(lipgloss.Left, listBox, detailBox)
 }
 
 // renderRequestList renders the list of requests
 func (a *App) renderRequestList(width, height int) string {
+	// If in filter mode, show filter UI at top
+	if a.focus == FocusFilter {
+		return a.renderFilterInPanel(width, height)
+	}
+
 	if len(a.requests) == 0 {
 		msg := "Waiting for requests..."
 		if a.loading {
@@ -302,8 +938,20 @@ func (a *App) renderRequestList(width, height int) string {
 		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, msg)
 	}
 
+	if len(a.filteredReqs) == 0 && (len(a.activeFilters) > 0 || a.searchQuery != "") {
+		msg := "No matching requests"
+		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, msg)
+	}
+
 	var lines []string
+
+	// Title with filter/search count
 	title := ListTitleStyle.Render("Requests")
+	if len(a.activeFilters) > 0 || a.searchQuery != "" {
+		filterInfo := lipgloss.NewStyle().Foreground(ColorMuted).
+			Render(fmt.Sprintf(" (%d/%d)", len(a.filteredReqs), len(a.requests)))
+		title = title + filterInfo
+	}
 	lines = append(lines, title)
 
 	visibleLines := height - 2
@@ -314,10 +962,10 @@ func (a *App) renderRequestList(width, height int) string {
 		startIdx = a.selected - visibleLines + 1
 	}
 
-	endIdx := min(startIdx+visibleLines, len(a.requests))
+	endIdx := min(startIdx+visibleLines, len(a.filteredReqs))
 
 	for i := startIdx; i < endIdx; i++ {
-		req := a.requests[i]
+		req := a.filteredReqs[i]
 		line := a.renderRequestLine(req, width-2, i == a.selected)
 		lines = append(lines, line)
 	}
@@ -325,150 +973,508 @@ func (a *App) renderRequestList(width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderRequestLine renders a single request line
-func (a *App) renderRequestLine(req ngrok.Request, width int, selected bool) string {
-	method := MethodStyle.
-		Foreground(MethodColor(req.Request.Method)).
-		Render(fmt.Sprintf("%-6s", req.Request.Method))
+// renderFilterInPanel renders the filter UI inside the request list panel
+func (a *App) renderFilterInPanel(width, height int) string {
+	var lines []string
 
-	status := StatusStyle.
-		Foreground(StatusCodeColor(req.StatusCode())).
-		Render(fmt.Sprintf("%d", req.StatusCode()))
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary)
+	mutedStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+	selectedStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
 
-	duration := DurationStyle.Render(fmt.Sprintf("%6.0fms", req.DurationMs()))
+	switch a.filterStep {
+	case FilterStepField:
+		lines = append(lines, titleStyle.Render("Add Filter"))
+		lines = append(lines, "")
 
-	// Calculate remaining width for path
-	fixedWidth := 6 + 1 + 3 + 1 + 8 // method + space + status + space + duration
-	pathWidth := width - fixedWidth - 4
+		if a.filterInput != "" {
+			lines = append(lines, mutedStyle.Render("Search: ")+a.filterInput+"█")
+			lines = append(lines, "")
+		}
 
-	path := util.TruncateString(req.Request.URI, pathWidth)
-	pathStyled := PathStyle.Render(path)
+		for i, f := range a.filteredFields {
+			if i == a.filterSelected {
+				lines = append(lines, selectedStyle.Render("▶ "+f.Name))
+			} else {
+				lines = append(lines, "  "+f.Name)
+			}
+		}
 
-	line := fmt.Sprintf("%s %s %s %s", method, status, pathStyled, duration)
+		if len(a.filteredFields) == 0 {
+			lines = append(lines, mutedStyle.Render("  No matching fields"))
+		}
 
-	if selected {
-		return SelectedItemStyle.Width(width).Render(line)
+	case FilterStepOperator:
+		field := a.getFieldByKey(a.pendingFilter.Field)
+		if field != nil {
+			lines = append(lines, titleStyle.Render("Select Operator"))
+			lines = append(lines, mutedStyle.Render("Field: "+field.Name))
+			lines = append(lines, "")
+
+			for i, op := range field.Operators {
+				if i == a.filterSelected {
+					lines = append(lines, selectedStyle.Render("▶ "+op))
+				} else {
+					lines = append(lines, "  "+op)
+				}
+			}
+		}
+
+	case FilterStepValue:
+		field := a.getFieldByKey(a.pendingFilter.Field)
+		if field != nil {
+			lines = append(lines, titleStyle.Render("Enter Value"))
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("%s %s ?", field.Name, a.pendingFilter.Operator)))
+			lines = append(lines, "")
+			lines = append(lines, "> "+a.filterInput+"█")
+		}
 	}
-	return NormalItemStyle.Width(width).Render(line)
+
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("↑↓: select  Enter: confirm  Esc: cancel"))
+
+	return strings.Join(lines, "\n")
+}
+
+// renderRequestLine renders a single request line (compact mode)
+func (a *App) renderRequestLine(req ngrok.Request, width int, selected bool) string {
+	statusCode := req.StatusCode()
+	timeAgo := formatRelativeTime(req.Start)
+
+	// Compact format: "▶ METHOD  STATUS PATH         TIME"
+	// Widths:          2  8       4     var          6
+	// METHOD is 8 chars to fit "OPTIONS" (7) + space
+	fixedWidth := 2 + 8 + 4 + 6
+	pathWidth := width - fixedWidth
+	if pathWidth < 8 {
+		pathWidth = 8
+	}
+
+	pathStr := util.TruncateString(req.Request.URI, pathWidth)
+
+	// Build the line with proper formatting
+	var indicator string
+	if selected {
+		indicator = lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("▶ ")
+	} else {
+		indicator = "  "
+	}
+
+	// Apply highlighting if search is active
+	methodStr := req.Request.Method
+	statusStr := fmt.Sprintf("%d", statusCode)
+
+	if a.searchQuery != "" {
+		methodStr = a.highlightText(methodStr)
+		statusStr = a.highlightText(statusStr)
+		pathStr = a.highlightText(pathStr)
+	}
+
+	method := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(MethodColor(req.Request.Method)).
+		Width(8).
+		Render(methodStr)
+
+	status := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(StatusCodeColor(statusCode)).
+		Width(4).
+		Render(statusStr)
+
+	path := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#D1D5DB")).
+		Width(pathWidth).
+		Render(pathStr)
+
+	time := lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		Width(6).
+		Align(lipgloss.Right).
+		Render(timeAgo)
+
+	return fmt.Sprintf("%s%s%s%s%s", indicator, method, status, path, time)
+}
+
+// highlightText highlights search query matches in text with yellow background
+func (a *App) highlightText(text string) string {
+	if a.searchQuery == "" {
+		return text
+	}
+
+	query := strings.ToLower(a.searchQuery)
+	lowerText := strings.ToLower(text)
+
+	// Find all match positions
+	var result strings.Builder
+	lastEnd := 0
+
+	highlightStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color("#FBBF24")).
+		Foreground(lipgloss.Color("#000000"))
+
+	for {
+		idx := strings.Index(lowerText[lastEnd:], query)
+		if idx == -1 {
+			result.WriteString(text[lastEnd:])
+			break
+		}
+
+		matchStart := lastEnd + idx
+		matchEnd := matchStart + len(a.searchQuery)
+
+		// Add text before match
+		result.WriteString(text[lastEnd:matchStart])
+		// Add highlighted match (preserve original case)
+		result.WriteString(highlightStyle.Render(text[matchStart:matchEnd]))
+
+		lastEnd = matchEnd
+	}
+
+	return result.String()
+}
+
+// formatRelativeTime formats a time as relative (e.g., "2m ago", "5s ago")
+func formatRelativeTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+
+	diff := time.Since(t)
+
+	switch {
+	case diff < time.Second:
+		return "now"
+	case diff < time.Minute:
+		return fmt.Sprintf("%ds", int(diff.Seconds()))
+	case diff < time.Hour:
+		return fmt.Sprintf("%dm", int(diff.Minutes()))
+	case diff < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(diff.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(diff.Hours()/24))
+	}
+}
+
+// httpStatusText returns the standard HTTP status text for a status code
+func httpStatusText(code int) string {
+	statusTexts := map[int]string{
+		100: "Continue",
+		101: "Switching Protocols",
+		200: "OK",
+		201: "Created",
+		202: "Accepted",
+		204: "No Content",
+		206: "Partial Content",
+		301: "Moved Permanently",
+		302: "Found",
+		303: "See Other",
+		304: "Not Modified",
+		307: "Temporary Redirect",
+		308: "Permanent Redirect",
+		400: "Bad Request",
+		401: "Unauthorized",
+		403: "Forbidden",
+		404: "Not Found",
+		405: "Method Not Allowed",
+		406: "Not Acceptable",
+		408: "Request Timeout",
+		409: "Conflict",
+		410: "Gone",
+		411: "Length Required",
+		412: "Precondition Failed",
+		413: "Payload Too Large",
+		414: "URI Too Long",
+		415: "Unsupported Media Type",
+		416: "Range Not Satisfiable",
+		422: "Unprocessable Entity",
+		429: "Too Many Requests",
+		500: "Internal Server Error",
+		501: "Not Implemented",
+		502: "Bad Gateway",
+		503: "Service Unavailable",
+		504: "Gateway Timeout",
+	}
+	if text, ok := statusTexts[code]; ok {
+		return text
+	}
+	return ""
 }
 
 // renderDetailPanel renders the detail panel (side panel mode)
 func (a *App) renderDetailPanel(width, height int) string {
-	if len(a.requests) == 0 || a.selected >= len(a.requests) {
+	if len(a.filteredReqs) == 0 || a.selected >= len(a.filteredReqs) {
 		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center,
 			"Select a request to view details")
 	}
 
-	req := a.requests[a.selected]
-	return a.renderRequestDetail(req, width, height, false)
-}
-
-// renderDetailFullscreen renders the detail panel in fullscreen mode
-func (a *App) renderDetailFullscreen(height int) string {
-	if len(a.requests) == 0 || a.selected >= len(a.requests) {
-		return ""
-	}
-
-	content := ActiveBorderStyle.
-		Width(a.width - 4).
-		Height(height - 2).
-		Render(a.viewport.View())
-
-	return content
+	// Use viewport for scrollable content
+	return a.detailViewport.View()
 }
 
 // renderRequestDetail renders request details
 func (a *App) renderRequestDetail(req ngrok.Request, width, height int, full bool) string {
 	var sb strings.Builder
 
-	// Title
-	title := DetailTitleStyle.Render(fmt.Sprintf("%s %s", req.Request.Method, req.Request.URI))
-	sb.WriteString(title + "\n\n")
+	// Title with colored method (badge style)
+	method := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#000000")).
+		Background(MethodColor(req.Request.Method)).
+		Padding(0, 1).
+		Render(req.Request.Method)
 
-	// Status and timing
-	status := StatusStyle.
-		Foreground(StatusCodeColor(req.StatusCode())).
-		Render(req.ResponseStatus)
-	sb.WriteString(fmt.Sprintf("%s %s  %s %.2fms\n\n",
-		DetailLabelStyle.Render("Status:"), status,
-		DetailLabelStyle.Render("Duration:"), req.DurationMs()))
+	// Highlight endpoint if search is active
+	endpointText := req.Request.URI
+	if a.searchQuery != "" {
+		endpointText = a.highlightText(endpointText)
+	}
+	endpoint := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Render(endpointText)
+	sb.WriteString(fmt.Sprintf("%s %s\n\n", method, endpoint))
 
-	// Request headers
-	sb.WriteString(DetailLabelStyle.Render("Request Headers:\n"))
-	for key, values := range req.Request.Headers {
-		for _, v := range values {
-			sb.WriteString(fmt.Sprintf("  %s: %s\n",
-				DetailValueStyle.Render(key),
-				lipgloss.NewStyle().Foreground(ColorMuted).Render(v)))
+	// Status with full text
+	statusCode := req.StatusCode()
+	statusText := fmt.Sprintf("%d %s", statusCode, httpStatusText(statusCode))
+	if a.searchQuery != "" {
+		statusText = a.highlightText(statusText)
+	}
+	status := StatusStyle.Foreground(StatusCodeColor(statusCode)).Render(statusText)
+	sb.WriteString(fmt.Sprintf("Status:   %s\n", status))
+
+	// Duration
+	sb.WriteString(fmt.Sprintf("Duration: %.2fms\n", req.DurationMs()))
+
+	// Timestamp
+	timestamp := req.Start.Format("2006-01-02 15:04:05")
+	sb.WriteString(fmt.Sprintf("Time:     %s\n", timestamp))
+
+	// Request headers (sorted to prevent flickering)
+	sb.WriteString("\n")
+	sb.WriteString(DetailLabelStyle.Render("Request Headers:"))
+	sb.WriteString("\n")
+	sb.WriteString(a.renderHeaders(req.Request.Headers))
+
+	// Request body (if available) - decode from base64
+	reqBody := req.Request.DecodeBody()
+	if reqBody != "" {
+		sb.WriteString("\n")
+		sb.WriteString(DetailLabelStyle.Render("Request Body:"))
+		sb.WriteString("\n")
+		reqContentType := ""
+		if ct, ok := req.Request.Headers["Content-Type"]; ok && len(ct) > 0 {
+			reqContentType = ct[0]
 		}
+		formattedReqBody := util.FormatBody(reqBody, reqContentType)
+		if a.searchQuery != "" {
+			formattedReqBody = a.highlightText(formattedReqBody)
+		}
+		sb.WriteString(indentLines(formattedReqBody, "  "))
+		sb.WriteString("\n") // Extra blank line after request body
 	}
 
-	// Response headers
-	sb.WriteString("\n" + DetailLabelStyle.Render("Response Headers:\n"))
-	for key, values := range req.Response.Headers {
-		for _, v := range values {
-			sb.WriteString(fmt.Sprintf("  %s: %s\n",
-				DetailValueStyle.Render(key),
-				lipgloss.NewStyle().Foreground(ColorMuted).Render(v)))
-		}
-	}
+	// Response headers (sorted to prevent flickering)
+	sb.WriteString("\n")
+	sb.WriteString(DetailLabelStyle.Render("Response Headers:"))
+	sb.WriteString("\n")
+	sb.WriteString(a.renderHeaders(req.Response.Headers))
 
-	// Body preview (if available)
-	if req.Response.Raw != "" {
-		sb.WriteString("\n" + DetailLabelStyle.Render("Response Body:\n"))
-		contentType := ""
+	// Response body (if available) - decode from base64
+	respBody := req.Response.DecodeBody()
+	if respBody != "" {
+		sb.WriteString("\n")
+		sb.WriteString(DetailLabelStyle.Render("Response Body:"))
+		sb.WriteString("\n")
+		respContentType := ""
 		if ct, ok := req.Response.Headers["Content-Type"]; ok && len(ct) > 0 {
-			contentType = ct[0]
+			respContentType = ct[0]
 		}
-		body := util.FormatBody(req.Response.Raw, contentType)
-		sb.WriteString(body)
+		formattedRespBody := util.FormatBody(respBody, respContentType)
+		if a.searchQuery != "" {
+			formattedRespBody = a.highlightText(formattedRespBody)
+		}
+		sb.WriteString(indentLines(formattedRespBody, "  "))
 	}
 
 	return sb.String()
 }
 
+// indentLines adds a prefix to each line of text
+func indentLines(text, prefix string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = prefix + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderHeaders renders headers in sorted order to prevent flickering
+func (a *App) renderHeaders(headers map[string][]string) string {
+	if len(headers) == 0 {
+		return "  (none)\n"
+	}
+
+	// Get sorted keys
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	for _, key := range keys {
+		values := headers[key]
+		for _, v := range values {
+			headerLine := fmt.Sprintf("%s: %s", key, v)
+			if a.searchQuery != "" {
+				headerLine = a.highlightText(headerLine)
+			}
+			sb.WriteString(fmt.Sprintf("  %s\n", headerLine))
+		}
+	}
+	return sb.String()
+}
+
 // renderFooter renders the help footer
 func (a *App) renderFooter() string {
+	// Search mode: show search input
+	if a.focus == FocusSearch {
+		prompt := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("/")
+
+		// Build input with cursor
+		input := a.searchQuery
+		if a.searchCursor < len(input) {
+			input = input[:a.searchCursor] + "█" + input[a.searchCursor:]
+		} else {
+			input = input + "█"
+		}
+
+		searchLine := fmt.Sprintf("%s %s", prompt, input)
+		hint := lipgloss.NewStyle().Foreground(ColorMuted).
+			Render("  (enter: search, esc: cancel)")
+
+		return HelpStyle.Width(a.width).Padding(0, 1).Render(searchLine + hint)
+	}
+
+
+	// Build status line with active filters and search
+	var statusParts []string
+
+	// Show active filters
+	for _, f := range a.activeFilters {
+		badge := lipgloss.NewStyle().
+			Background(ColorPrimary).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %s %s", f.Field, f.Operator, f.Value))
+		statusParts = append(statusParts, badge)
+	}
+
+	// Show search query
+	if a.searchQuery != "" {
+		searchBadge := lipgloss.NewStyle().
+			Background(ColorWarning).
+			Foreground(lipgloss.Color("#000000")).
+			Padding(0, 1).
+			Render("/" + a.searchQuery)
+		statusParts = append(statusParts, searchBadge)
+	}
+
+	// Help text
 	var help string
-	if a.focus == FocusDetail {
-		help = fmt.Sprintf("%s scroll  %s back  %s replay  %s quit",
+	if a.focus == FocusFilter {
+		help = fmt.Sprintf("%s select  %s confirm  %s cancel",
+			HelpKeyStyle.Render("↑↓"),
+			HelpKeyStyle.Render("enter"),
+			HelpKeyStyle.Render("esc"))
+	} else if a.focus == FocusDetailPanel {
+		help = fmt.Sprintf("%s scroll  %s list  %s copy  %s replay  %s quit",
 			HelpKeyStyle.Render("j/k"),
-			HelpKeyStyle.Render("esc"),
+			HelpKeyStyle.Render("tab"),
+			HelpKeyStyle.Render("c"),
 			HelpKeyStyle.Render("r"),
 			HelpKeyStyle.Render("q"))
 	} else {
-		help = fmt.Sprintf("%s navigate  %s expand  %s replay  %s quit",
+		help = fmt.Sprintf("%s nav  %s search  %s filter  %s copy  %s replay  %s quit",
 			HelpKeyStyle.Render("j/k"),
-			HelpKeyStyle.Render("enter"),
+			HelpKeyStyle.Render("/"),
+			HelpKeyStyle.Render("f"),
+			HelpKeyStyle.Render("c"),
 			HelpKeyStyle.Render("r"),
 			HelpKeyStyle.Render("q"))
+	}
+
+	// Add clear hint if filters or search active
+	if len(a.activeFilters) > 0 || a.searchQuery != "" {
+		help = fmt.Sprintf("%s clear  ", HelpKeyStyle.Render("x")) + help
+	}
+
+	// Combine status and help
+	var footer string
+	if len(statusParts) > 0 {
+		footer = strings.Join(statusParts, " ") + "  " + help
+	} else {
+		footer = help
 	}
 
 	// Add error message if present
 	if a.lastError != nil {
-		errMsg := ErrorStyle.Render(fmt.Sprintf(" Error: %s", a.lastError.Error()))
-		help = errMsg + "  " + help
+		errMsg := ErrorStyle.Render(fmt.Sprintf("Error: %s  ", a.lastError.Error()))
+		footer = errMsg + footer
 	}
 
-	return HelpStyle.Width(a.width).Padding(0, 1).Render(help)
+	return HelpStyle.Width(a.width).Padding(0, 1).Render(footer)
 }
 
 // updateViewportSize updates the viewport dimensions
 func (a *App) updateViewportSize() {
-	contentHeight := a.height - 6 // header + footer + borders
-	a.viewport = viewport.New(a.width-4, contentHeight)
-	a.viewport.Style = lipgloss.NewStyle()
+	contentHeight := a.height - 4 // header + footer
+
+	// Calculate detail panel size for split view
+	var detailWidth, detailHeight int
+	if a.width >= 120 {
+		// Side by side: 30% list, 70% detail
+		listWidth := a.width * 30 / 100
+		if listWidth < 36 {
+			listWidth = 36
+		}
+		detailWidth = a.width - listWidth - 4 // border + padding
+		detailHeight = contentHeight - 2      // border
+	} else {
+		// Stacked: 40% list, 60% detail
+		listHeight := contentHeight * 40 / 100
+		if listHeight < 8 {
+			listHeight = 8
+		}
+		detailWidth = a.width - 4               // border + padding
+		detailHeight = contentHeight - listHeight - 2
+	}
+	a.detailViewport = viewport.New(detailWidth, detailHeight)
+	a.detailViewport.Style = lipgloss.NewStyle()
+
+	// Update content if we have requests
+	a.updateDetailViewport()
 }
 
-// updateDetailContent updates the viewport content with current selection
-func (a *App) updateDetailContent() {
-	if len(a.requests) == 0 || a.selected >= len(a.requests) {
+// updateDetailViewport updates the split-view detail viewport
+func (a *App) updateDetailViewport() {
+	if len(a.filteredReqs) == 0 || a.selected >= len(a.filteredReqs) {
+		a.detailViewport.SetContent("Select a request to view details")
 		return
 	}
-	req := a.requests[a.selected]
-	content := a.renderRequestDetail(req, a.width-6, a.height-6, true)
-	a.viewport.SetContent(content)
-	a.viewport.GotoTop()
+
+	req := a.filteredReqs[a.selected]
+
+	// Only update if selection changed
+	if req.ID != a.lastSelectedID {
+		a.lastSelectedID = req.ID
+		content := a.renderRequestDetail(req, a.detailViewport.Width, a.detailViewport.Height, false)
+		a.detailViewport.SetContent(content)
+		a.detailViewport.GotoTop()
+	}
 }
 
 // Command helpers
@@ -493,10 +1499,10 @@ func (a *App) fetchRequests() tea.Cmd {
 	}
 }
 
-func (a *App) replayRequest(id string) tea.Cmd {
+func (a *App) replayRequest(requestID string) tea.Cmd {
 	return func() tea.Msg {
-		err := a.client.Replay(id)
-		return messages.ReplayMsg{RequestID: id, Err: err}
+		err := a.client.Replay(requestID)
+		return messages.ReplayMsg{RequestID: requestID, Err: err}
 	}
 }
 

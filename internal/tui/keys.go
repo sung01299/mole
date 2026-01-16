@@ -15,6 +15,10 @@ type KeyMap struct {
 	Escape key.Binding
 	Replay key.Binding
 	Toggle key.Binding
+	Search key.Binding
+	Filter key.Binding
+	Copy   key.Binding
+	Clear  key.Binding
 
 	// Scrolling (for detail view)
 	ScrollUp   key.Binding
@@ -48,19 +52,35 @@ func DefaultKeyMap() KeyMap {
 		),
 		Enter: key.NewBinding(
 			key.WithKeys("enter"),
-			key.WithHelp("enter", "expand"),
+			key.WithHelp("enter", "confirm"),
 		),
 		Escape: key.NewBinding(
 			key.WithKeys("esc"),
-			key.WithHelp("esc", "back"),
+			key.WithHelp("esc", "back/clear"),
 		),
 		Replay: key.NewBinding(
 			key.WithKeys("r"),
 			key.WithHelp("r", "replay"),
 		),
 		Toggle: key.NewBinding(
-			key.WithKeys("tab", "b"),
-			key.WithHelp("tab/b", "toggle sidebar"),
+			key.WithKeys("tab"),
+			key.WithHelp("tab", "switch panel"),
+		),
+		Search: key.NewBinding(
+			key.WithKeys("/"),
+			key.WithHelp("/", "search"),
+		),
+		Filter: key.NewBinding(
+			key.WithKeys("f"),
+			key.WithHelp("f", "filter"),
+		),
+		Copy: key.NewBinding(
+			key.WithKeys("c"),
+			key.WithHelp("c", "copy curl"),
+		),
+		Clear: key.NewBinding(
+			key.WithKeys("x"),
+			key.WithHelp("x", "clear"),
 		),
 		ScrollUp: key.NewBinding(
 			key.WithKeys("ctrl+u"),
