@@ -1,12 +1,16 @@
 # Mole
 
 <p align="center">
-  <img src="mole-logo.png" alt="Mole" width="400">
+  <img src="assets/mole-logo.png" alt="Mole" width="400">
 </p>
 
 > The missing TUI for ngrok
 
 Mole is a terminal-based user interface for monitoring and debugging ngrok traffic. Stop context-switching to your browser — inspect webhooks, replay requests, and debug APIs without leaving your terminal.
+
+<p align="center">
+  <img src="assets/mole demo.png" alt="Mole Demo" width="800">
+</p>
 
 ## ✨ Features
 
@@ -44,14 +48,7 @@ Mole is a terminal-based user interface for monitoring and debugging ngrok traff
 git clone https://github.com/sung01299/mole.git
 cd mole
 make build
-./mole  # Run the binary
-```
-
-To install globally (adds to $GOPATH/bin):
-
-```bash
 make install
-mole  # Now available anywhere
 ```
 
 ### Using go install
@@ -59,6 +56,17 @@ mole  # Now available anywhere
 ```bash
 go install github.com/sung01299/mole@latest
 ```
+
+> **Note**: If `mole` command is not found after installation, add Go bin to your PATH:
+> ```bash
+> # For zsh (macOS default)
+> echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.zshrc
+> source ~/.zshrc
+>
+> # For bash
+> echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.bashrc
+> source ~/.bashrc
+> ```
 
 ## 🚀 Usage
 
@@ -71,9 +79,7 @@ ngrok http 8080
 2. Run mole in another terminal:
 
 ```bash
-./mole  # If built from source
-# or
-mole    # If installed via 'make install' or 'go install'
+mole
 ```
 
 ## ⌨️ Keybindings
