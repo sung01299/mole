@@ -1,6 +1,8 @@
 # Mole
 
-![Mole](mole-logo.png)
+<p align="center">
+  <img src="mole-logo.png" alt="Mole" width="200">
+</p>
 
 > The missing TUI for ngrok
 
@@ -28,8 +30,6 @@ Mole is a terminal-based user interface for monitoring and debugging ngrok traff
 ### History & Persistence
 - **Session history** — Browse and search past sessions (`h`)
 - **Persistent storage** — All requests are saved to local SQLite database
-- **Star requests** — Bookmark important requests for quick access (`s`)
-- **Export to JSON** — Export sessions or individual requests (`e`)
 
 ### Navigation
 - **Vim-style keybindings** — Navigate with `j`/`k`, `g`/`G`, and other familiar keys
