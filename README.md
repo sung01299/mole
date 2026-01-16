@@ -41,21 +41,23 @@ Mole is a terminal-based user interface for monitoring and debugging ngrok traff
 ### From Source
 
 ```bash
-git clone https://github.com/mole-cli/mole.git
+git clone https://github.com/sung01299/mole.git
 cd mole
 make build
+./mole  # Run the binary
 ```
 
-Or install directly:
+To install globally (adds to $GOPATH/bin):
+
+```bash
+make install
+mole  # Now available anywhere
+```
+
+### Using go install
 
 ```bash
 go install github.com/sung01299/mole@latest
-```
-
-### Using Homebrew (coming soon)
-
-```bash
-brew install mole-cli/tap/mole
 ```
 
 ## 🚀 Usage
@@ -69,7 +71,9 @@ ngrok http 8080
 2. Run mole in another terminal:
 
 ```bash
-mole
+./mole  # If built from source
+# or
+mole    # If installed via 'make install' or 'go install'
 ```
 
 ## ⌨️ Keybindings
