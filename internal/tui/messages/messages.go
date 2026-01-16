@@ -3,7 +3,7 @@ package messages
 import (
 	"time"
 
-	"github.com/mole-cli/mole/internal/ngrok"
+	"github.com/sung01299/mole/internal/ngrok"
 )
 
 // TickMsg is sent periodically to trigger data refresh

@@ -11,14 +11,17 @@ type KeyMap struct {
 	Bottom key.Binding
 
 	// Actions
-	Enter  key.Binding
-	Escape key.Binding
-	Replay key.Binding
-	Toggle key.Binding
-	Search key.Binding
-	Filter key.Binding
-	Copy   key.Binding
-	Clear  key.Binding
+	Enter      key.Binding
+	Escape     key.Binding
+	Replay     key.Binding
+	ReplayEdit key.Binding
+	Diff       key.Binding
+	Toggle     key.Binding
+	Search     key.Binding
+	Filter     key.Binding
+	Copy       key.Binding
+	Clear      key.Binding
+	History    key.Binding
 
 	// Scrolling (for detail view)
 	ScrollUp   key.Binding
@@ -62,6 +65,14 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("r"),
 			key.WithHelp("r", "replay"),
 		),
+		ReplayEdit: key.NewBinding(
+			key.WithKeys("R"),
+			key.WithHelp("R", "replay with edit"),
+		),
+		Diff: key.NewBinding(
+			key.WithKeys("d"),
+			key.WithHelp("d", "diff"),
+		),
 		Toggle: key.NewBinding(
 			key.WithKeys("tab"),
 			key.WithHelp("tab", "switch panel"),
@@ -81,6 +92,10 @@ func DefaultKeyMap() KeyMap {
 		Clear: key.NewBinding(
 			key.WithKeys("x"),
 			key.WithHelp("x", "clear"),
+		),
+		History: key.NewBinding(
+			key.WithKeys("h"),
+			key.WithHelp("h", "history"),
 		),
 		ScrollUp: key.NewBinding(
 			key.WithKeys("ctrl+u"),

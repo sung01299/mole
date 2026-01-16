@@ -6,8 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/mole-cli/mole/internal/ngrok"
-	"github.com/mole-cli/mole/internal/tui"
+	"github.com/sung01299/mole/internal/ngrok"
+	"github.com/sung01299/mole/internal/tui"
 )
 
 const version = "0.1.0"

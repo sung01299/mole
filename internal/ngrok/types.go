@@ -177,3 +177,9 @@ func (r *Request) StatusCode() int {
 func (r *Request) DurationMs() float64 {
 	return float64(r.Duration) / 1_000_000
 }
+
+// ResponseSize returns the size of the response body in bytes
+func (r *Request) ResponseSize() int {
+	body := r.Response.DecodeBody()
+	return len(body)
+}

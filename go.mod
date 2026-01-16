@@ -1,4 +1,4 @@
-module github.com/mole-cli/mole
+module github.com/sung01299/mole
 
 go 1.25.5
 
@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/mattn/go-sqlite3 v1.14.33
 )
 
 require (

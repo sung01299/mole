@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -15,19 +17,35 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/mole-cli/mole/internal/ngrok"
-	"github.com/mole-cli/mole/internal/tui/messages"
-	"github.com/mole-cli/mole/internal/util"
+	"github.com/sung01299/mole/internal/ngrok"
+	"github.com/sung01299/mole/internal/storage"
+	"github.com/sung01299/mole/internal/tui/messages"
+	"github.com/sung01299/mole/internal/util"
 )
 
 // FocusState represents which panel is currently focused
 type FocusState int
 
 const (
-	FocusList FocusState = iota
-	FocusDetailPanel // Detail panel in split view (scrollable)
-	FocusSearch      // Search input mode
-	FocusFilter      // Filter mode
+	FocusList        FocusState = iota
+	FocusDetailPanel            // Detail panel in split view (scrollable)
+	FocusSearch                 // Search input mode
+	FocusFilter                 // Filter mode
+	FocusReplayEdit             // Replay with edit mode
+	FocusDiff                   // Diff view mode
+	FocusHistory                // History view mode
+)
+
+// ReplayEditStep represents the current step in replay edit
+type ReplayEditStep int
+
+const (
+	ReplayEditStepMain ReplayEditStep = iota // Main menu (Method, Path, Headers, Body, Send)
+	ReplayEditStepMethod
+	ReplayEditStepPath
+	ReplayEditStepHeaders
+	ReplayEditStepHeaderEdit // Editing a single header
+	ReplayEditStepBody
 )
 
 // FilterStep represents the current step in filter creation
@@ -36,28 +54,93 @@ type FilterStep int
 const (
 	FilterStepField FilterStep = iota
 	FilterStepOperator
+	FilterStepUnit
 	FilterStepValue
+	FilterStepLogical // Ask for && or || after adding a filter
+)
+
+// FilterFieldType defines the type of filter field
+type FilterFieldType int
+
+const (
+	FilterTypeString FilterFieldType = iota
+	FilterTypeNumericWithUnit
 )
 
 // Filter represents an active filter
 type Filter struct {
-	Field    string
-	Operator string
-	Value    string
+	Field           string
+	Operator        string
+	Unit            string // For numeric fields with units (ms, s, kb, etc.)
+	Value           string
+	LogicalOperator string // "&&" or "||" to chain with next filter
 }
+
+// HeaderEntry represents a header key-value pair for editing
+type HeaderEntry struct {
+	Key   string
+	Value string
+}
+
+// HTTP methods for replay edit
+var httpMethods = []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
 
 // FilterField defines a filterable field
 type FilterField struct {
 	Name      string
 	Key       string
+	Type      FilterFieldType
 	Operators []string
+	Units     []string // For numeric fields
 }
 
 var filterFields = []FilterField{
-	{Name: "Status Code", Key: "status", Operators: []string{"=", "!=", ">", "<", ">=", "<="}},
-	{Name: "Method", Key: "method", Operators: []string{"=", "!="}},
-	{Name: "Path", Key: "path", Operators: []string{"contains", "=", "starts", "ends"}},
-	{Name: "Duration (ms)", Key: "duration", Operators: []string{"=", ">", "<", ">=", "<="}},
+	// Basic fields
+	{Name: "Duration", Key: "duration", Type: FilterTypeNumericWithUnit, Operators: []string{">", "<", ">=", "<="}, Units: []string{"ms", "s", "m", "h", "d"}},
+	{Name: "Path", Key: "path", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "ResponseSize", Key: "response_size", Type: FilterTypeNumericWithUnit, Operators: []string{">", "<", ">=", "<="}, Units: []string{"b", "kb", "mb"}},
+	{Name: "StatusCode", Key: "status", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	// Headers
+	{Name: "Headers.Accept", Key: "header.accept", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Accept-Charset", Key: "header.accept-charset", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Accept-Datetime", Key: "header.accept-datetime", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Accept-Encoding", Key: "header.accept-encoding", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Accept-Language", Key: "header.accept-language", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.A-IM", Key: "header.a-im", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Authorization", Key: "header.authorization", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Cache-Control", Key: "header.cache-control", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Connection", Key: "header.connection", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Content-Length", Key: "header.content-length", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Content-MD5", Key: "header.content-md5", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Content-Type", Key: "header.content-type", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Cookie", Key: "header.cookie", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Date", Key: "header.date", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Expect", Key: "header.expect", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.From", Key: "header.from", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Host", Key: "header.host", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Max-Forwards", Key: "header.max-forwards", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Origin", Key: "header.origin", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Pragma", Key: "header.pragma", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Proxy-Authorization", Key: "header.proxy-authorization", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Range", Key: "header.range", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Referer", Key: "header.referer", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.TE", Key: "header.te", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Upgrade", Key: "header.upgrade", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.User-Agent", Key: "header.user-agent", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Via", Key: "header.via", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Warning", Key: "header.warning", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.If-Match", Key: "header.if-match", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.If-Modified-Since", Key: "header.if-modified-since", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.If-None-Match", Key: "header.if-none-match", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.If-Range", Key: "header.if-range", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.If-Unmodified-Since", Key: "header.if-unmodified-since", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Forwarded", Key: "header.forwarded", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.X-Forwarded-For", Key: "header.x-forwarded-for", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.X-Forwarded-Host", Key: "header.x-forwarded-host", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.X-Forwarded-Proto", Key: "header.x-forwarded-proto", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Access-Control-Request-Headers", Key: "header.access-control-request-headers", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Access-Control-Request-Method", Key: "header.access-control-request-method", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
+	{Name: "Headers.Server", Key: "header.server", Type: FilterTypeString, Operators: []string{"==", "!=", "match", "!match"}},
 }
 
 // Polling intervals
@@ -83,7 +166,7 @@ type App struct {
 	selected       int
 	lastError      error
 	lastSelectedID string // Track selected request ID for viewport updates
-	
+
 	// Status messages
 	statusMessage     string
 	statusMessageTime time.Time
@@ -96,10 +179,32 @@ type App struct {
 	filterStep     FilterStep
 	filterInput    string
 	filterCursor   int
-	filterSelected int              // Selected item in field/operator list
-	activeFilters  []Filter         // Currently active filters
-	pendingFilter  Filter           // Filter being created
-	filteredFields []FilterField    // Filtered field list based on input
+	filterSelected int           // Selected item in field/operator list
+	activeFilters  []Filter      // Currently active filters
+	pendingFilter  Filter        // Filter being created
+	filteredFields []FilterField // Filtered field list based on input
+
+	// Replay Edit
+	replayEditStep     ReplayEditStep
+	replayEditSelected int
+	replayEditMethod   string
+	replayEditPath     string
+	replayEditHeaders  []HeaderEntry // Editable headers
+	replayEditBody     string
+	replayEditCursor   int    // Cursor position for text input
+	replayEditInput    string // Current input text
+	replayHeaderIdx    int    // Which header is being edited
+	replayHeaderField  string // "key" or "value" being edited
+
+	// Diff view
+	diffRequestA   *ngrok.Request // First request for diff (nil if not selected)
+	diffRequestB   *ngrok.Request // Second request for diff
+	diffViewport   viewport.Model // Viewport for diff content
+	diffScrollSync bool           // Whether to sync scroll between panels
+
+	// History view
+	historySessions     []storage.Session
+	historySelectedSess int // Selected session index
 
 	// Components
 	detailViewport viewport.Model // For detail panel scrolling
@@ -108,6 +213,12 @@ type App struct {
 
 	// API client
 	client *ngrok.Client
+
+	// Storage for persistent history
+	storage          *storage.Storage
+	savedReqIDs      map[string]bool // Track which requests have been saved
+	viewingHistory   bool            // Whether we're viewing historical session
+	viewingSessionID string          // ID of historical session being viewed
 
 	// State
 	loading     bool
@@ -121,8 +232,17 @@ func NewApp(client *ngrok.Client) *App {
 	s.Spinner = spinner.Dot
 	s.Style = SpinnerStyle
 
+	// Initialize storage (non-fatal if it fails)
+	store, err := storage.New()
+	if err != nil {
+		// Log error but continue without storage
+		store = nil
+	}
+
 	return &App{
 		client:      client,
+		storage:     store,
+		savedReqIDs: make(map[string]bool),
 		keys:        DefaultKeyMap(),
 		spinner:     s,
 		loading:     true,
@@ -133,6 +253,11 @@ func NewApp(client *ngrok.Client) *App {
 
 // Init implements tea.Model
 func (a *App) Init() tea.Cmd {
+	// Run cleanup on startup (keep 7 days or 1000 requests)
+	if a.storage != nil {
+		a.storage.Cleanup(7, 1000)
+	}
+
 	return tea.Batch(
 		a.spinner.Tick,
 		a.fetchTunnels(),
@@ -153,13 +278,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		// Handle mouse wheel scrolling on detail panel regardless of focus
+		// Handle mouse wheel scrolling on detail/diff panel regardless of focus
 		if msg.Action == tea.MouseActionPress {
 			switch msg.Button {
 			case tea.MouseButtonWheelUp:
-				a.detailViewport.LineUp(3)
+				if a.focus == FocusDiff {
+					a.diffViewport.LineUp(3)
+				} else {
+					a.detailViewport.LineUp(3)
+				}
 			case tea.MouseButtonWheelDown:
-				a.detailViewport.LineDown(3)
+				if a.focus == FocusDiff {
+					a.diffViewport.LineDown(3)
+				} else {
+					a.detailViewport.LineDown(3)
+				}
 			}
 		}
 
@@ -186,16 +319,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			a.tunnels = msg.Tunnels
 			a.lastError = nil
+
+			// Start storage session if we have tunnels and storage is available
+			if a.storage != nil && len(a.tunnels) > 0 && a.storage.CurrentSessionID() == "" {
+				tunnelURL := a.tunnels[0].PublicURL
+				a.storage.StartSession(tunnelURL)
+			}
 		}
 
 	case messages.RequestsMsg:
 		a.loading = false
 		if msg.Err != nil {
 			a.lastError = msg.Err
-		} else {
+		} else if !a.viewingHistory {
+			// Only update if not viewing historical session
 			// Preserve selection if possible
 			oldLen := len(a.requests)
 			a.requests = msg.Requests
+
+			// Auto-save new requests to storage
+			a.saveNewRequests()
+
 			// Apply current filters
 			a.applyFilters()
 			if a.selected >= len(a.filteredReqs) {
@@ -252,6 +396,21 @@ func (a *App) handleKeyPress(msg tea.KeyMsg) tea.Cmd {
 	// Handle filter mode input
 	if a.focus == FocusFilter {
 		return a.handleFilterInput(msg)
+	}
+
+	// Handle replay edit mode input
+	if a.focus == FocusReplayEdit {
+		return a.handleReplayEditInput(msg)
+	}
+
+	// Handle diff view input
+	if a.focus == FocusDiff {
+		return a.handleDiffInput(msg)
+	}
+
+	// Handle history view input
+	if a.focus == FocusHistory {
+		return a.handleHistoryInput(msg)
 	}
 
 	switch {
@@ -320,7 +479,10 @@ func (a *App) handleKeyPress(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case key.Matches(msg, a.keys.Escape):
-		if a.searchQuery != "" || len(a.activeFilters) > 0 {
+		if a.diffRequestA != nil {
+			// Cancel diff selection
+			a.diffRequestA = nil
+		} else if a.searchQuery != "" || len(a.activeFilters) > 0 {
 			a.clearAll()
 		} else if a.focus == FocusDetailPanel {
 			a.focus = FocusList
@@ -336,6 +498,41 @@ func (a *App) handleKeyPress(msg tea.KeyMsg) tea.Cmd {
 	case key.Matches(msg, a.keys.Replay):
 		if len(a.filteredReqs) > 0 && a.selected < len(a.filteredReqs) {
 			return a.replayRequest(a.filteredReqs[a.selected].ID)
+		}
+
+	case key.Matches(msg, a.keys.ReplayEdit):
+		if len(a.filteredReqs) > 0 && a.selected < len(a.filteredReqs) {
+			a.initReplayEdit(a.filteredReqs[a.selected])
+			a.prevFocus = a.focus
+			a.focus = FocusReplayEdit
+		}
+
+	case key.Matches(msg, a.keys.Diff):
+		if len(a.filteredReqs) > 0 && a.selected < len(a.filteredReqs) {
+			req := a.filteredReqs[a.selected]
+			if a.diffRequestA == nil {
+				// First request - mark it
+				a.diffRequestA = &req
+			} else if a.diffRequestA.ID == req.ID {
+				// Same request - unmark
+				a.diffRequestA = nil
+			} else {
+				// Second request - show diff
+				a.diffRequestB = &req
+				a.initDiffView()
+				a.prevFocus = a.focus
+				a.focus = FocusDiff
+			}
+		}
+
+	case key.Matches(msg, a.keys.History):
+		// If viewing history, go back to live
+		if a.viewingHistory {
+			a.exitHistoryView()
+		} else {
+			a.prevFocus = a.focus
+			a.focus = FocusHistory
+			a.initHistoryView()
 		}
 	}
 
@@ -402,8 +599,12 @@ func (a *App) handleFilterInput(msg tea.KeyMsg) tea.Cmd {
 		return a.handleFilterFieldInput(msg)
 	case FilterStepOperator:
 		return a.handleFilterOperatorInput(msg)
+	case FilterStepUnit:
+		return a.handleFilterUnitInput(msg)
 	case FilterStepValue:
 		return a.handleFilterValueInput(msg)
+	case FilterStepLogical:
+		return a.handleFilterLogicalInput(msg)
 	}
 	return nil
 }
@@ -468,9 +669,15 @@ func (a *App) handleFilterOperatorInput(msg tea.KeyMsg) tea.Cmd {
 	case tea.KeyEnter:
 		if a.filterSelected < len(field.Operators) {
 			a.pendingFilter.Operator = field.Operators[a.filterSelected]
-			a.filterStep = FilterStepValue
-			a.filterInput = ""
-			a.filterCursor = 0
+			a.filterSelected = 0
+			// If field has units, go to unit step; otherwise go to value step
+			if field.Type == FilterTypeNumericWithUnit && len(field.Units) > 0 {
+				a.filterStep = FilterStepUnit
+			} else {
+				a.filterStep = FilterStepValue
+				a.filterInput = ""
+				a.filterCursor = 0
+			}
 		}
 		return nil
 
@@ -489,7 +696,12 @@ func (a *App) handleFilterOperatorInput(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (a *App) handleFilterValueInput(msg tea.KeyMsg) tea.Cmd {
+func (a *App) handleFilterUnitInput(msg tea.KeyMsg) tea.Cmd {
+	field := a.getFieldByKey(a.pendingFilter.Field)
+	if field == nil {
+		return nil
+	}
+
 	switch msg.Type {
 	case tea.KeyEscape:
 		a.filterStep = FilterStepOperator
@@ -497,13 +709,48 @@ func (a *App) handleFilterValueInput(msg tea.KeyMsg) tea.Cmd {
 		return nil
 
 	case tea.KeyEnter:
+		if a.filterSelected < len(field.Units) {
+			a.pendingFilter.Unit = field.Units[a.filterSelected]
+			a.filterStep = FilterStepValue
+			a.filterInput = ""
+			a.filterCursor = 0
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.filterSelected > 0 {
+			a.filterSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.filterSelected < len(field.Units)-1 {
+			a.filterSelected++
+		}
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleFilterValueInput(msg tea.KeyMsg) tea.Cmd {
+	field := a.getFieldByKey(a.pendingFilter.Field)
+
+	switch msg.Type {
+	case tea.KeyEscape:
+		// Go back to previous step
+		if field != nil && field.Type == FilterTypeNumericWithUnit {
+			a.filterStep = FilterStepUnit
+		} else {
+			a.filterStep = FilterStepOperator
+		}
+		a.filterSelected = 0
+		return nil
+
+	case tea.KeyEnter:
 		if a.filterInput != "" {
 			a.pendingFilter.Value = a.filterInput
-			a.activeFilters = append(a.activeFilters, a.pendingFilter)
-			a.pendingFilter = Filter{}
-			a.filterInput = ""
-			a.focus = a.prevFocus
-			a.applyFilters()
+			a.filterStep = FilterStepLogical
+			a.filterSelected = 0
 		}
 		return nil
 
@@ -535,6 +782,57 @@ func (a *App) handleFilterValueInput(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+func (a *App) handleFilterLogicalInput(msg tea.KeyMsg) tea.Cmd {
+	// Options: Done (apply filter), && (add another with AND), || (add another with OR)
+	options := []string{"Done", "&&", "||"}
+
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.filterStep = FilterStepValue
+		return nil
+
+	case tea.KeyEnter:
+		switch a.filterSelected {
+		case 0: // Done - apply filter and exit
+			a.activeFilters = append(a.activeFilters, a.pendingFilter)
+			a.pendingFilter = Filter{}
+			a.filterInput = ""
+			a.focus = a.prevFocus
+			a.applyFilters()
+		case 1: // && - add filter with AND and continue
+			a.pendingFilter.LogicalOperator = "&&"
+			a.activeFilters = append(a.activeFilters, a.pendingFilter)
+			a.pendingFilter = Filter{}
+			a.filterInput = ""
+			a.filterStep = FilterStepField
+			a.filterSelected = 0
+			a.updateFilteredFields()
+		case 2: // || - add filter with OR and continue
+			a.pendingFilter.LogicalOperator = "||"
+			a.activeFilters = append(a.activeFilters, a.pendingFilter)
+			a.pendingFilter = Filter{}
+			a.filterInput = ""
+			a.filterStep = FilterStepField
+			a.filterSelected = 0
+			a.updateFilteredFields()
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.filterSelected > 0 {
+			a.filterSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.filterSelected < len(options)-1 {
+			a.filterSelected++
+		}
+		return nil
+	}
+	return nil
+}
+
 func (a *App) updateFilteredFields() {
 	if a.filterInput == "" {
 		a.filteredFields = filterFields
@@ -557,6 +855,822 @@ func (a *App) getFieldByKey(key string) *FilterField {
 		}
 	}
 	return nil
+}
+
+// initReplayEdit initializes replay edit mode with request data
+func (a *App) initReplayEdit(req ngrok.Request) {
+	a.replayEditStep = ReplayEditStepMain
+	a.replayEditSelected = 0
+	a.replayEditMethod = req.Request.Method
+	a.replayEditPath = req.Request.URI
+	a.replayEditBody = req.Request.DecodeBody()
+	a.replayEditCursor = 0
+	a.replayEditInput = ""
+
+	// Copy headers
+	a.replayEditHeaders = nil
+	for k, vals := range req.Request.Headers {
+		// Skip some internal headers
+		lowerK := strings.ToLower(k)
+		if lowerK == "host" || lowerK == "content-length" ||
+			strings.HasPrefix(lowerK, "x-forwarded") {
+			continue
+		}
+		for _, v := range vals {
+			a.replayEditHeaders = append(a.replayEditHeaders, HeaderEntry{Key: k, Value: v})
+		}
+	}
+}
+
+// handleReplayEditInput handles keyboard input in replay edit mode
+func (a *App) handleReplayEditInput(msg tea.KeyMsg) tea.Cmd {
+	switch a.replayEditStep {
+	case ReplayEditStepMain:
+		return a.handleReplayEditMain(msg)
+	case ReplayEditStepMethod:
+		return a.handleReplayEditMethod(msg)
+	case ReplayEditStepPath:
+		return a.handleReplayEditPath(msg)
+	case ReplayEditStepHeaders:
+		return a.handleReplayEditHeaders(msg)
+	case ReplayEditStepHeaderEdit:
+		return a.handleReplayEditHeaderEdit(msg)
+	case ReplayEditStepBody:
+		return a.handleReplayEditBody(msg)
+	}
+	return nil
+}
+
+func (a *App) handleReplayEditMain(msg tea.KeyMsg) tea.Cmd {
+	// Main menu: Method, Path, Headers, Body, Send, Cancel
+	menuItems := 6
+
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.focus = a.prevFocus
+		return nil
+
+	case tea.KeyEnter:
+		switch a.replayEditSelected {
+		case 0: // Method
+			a.replayEditStep = ReplayEditStepMethod
+			a.replayEditSelected = indexOf(httpMethods, a.replayEditMethod)
+		case 1: // Path
+			a.replayEditStep = ReplayEditStepPath
+			a.replayEditInput = a.replayEditPath
+			a.replayEditCursor = len(a.replayEditInput)
+		case 2: // Headers
+			a.replayEditStep = ReplayEditStepHeaders
+			a.replayEditSelected = 0
+		case 3: // Body
+			a.replayEditStep = ReplayEditStepBody
+			a.replayEditInput = a.replayEditBody
+			a.replayEditCursor = len(a.replayEditInput)
+		case 4: // Send
+			return a.sendEditedRequest()
+		case 5: // Cancel
+			a.focus = a.prevFocus
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.replayEditSelected > 0 {
+			a.replayEditSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.replayEditSelected < menuItems-1 {
+			a.replayEditSelected++
+		}
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleReplayEditMethod(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 0
+		return nil
+
+	case tea.KeyEnter:
+		if a.replayEditSelected < len(httpMethods) {
+			a.replayEditMethod = httpMethods[a.replayEditSelected]
+		}
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 0
+		return nil
+
+	case tea.KeyUp:
+		if a.replayEditSelected > 0 {
+			a.replayEditSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.replayEditSelected < len(httpMethods)-1 {
+			a.replayEditSelected++
+		}
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleReplayEditPath(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 1
+		return nil
+
+	case tea.KeyEnter:
+		a.replayEditPath = a.replayEditInput
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 1
+		return nil
+
+	case tea.KeyBackspace:
+		if len(a.replayEditInput) > 0 && a.replayEditCursor > 0 {
+			a.replayEditInput = a.replayEditInput[:a.replayEditCursor-1] + a.replayEditInput[a.replayEditCursor:]
+			a.replayEditCursor--
+		}
+		return nil
+
+	case tea.KeyLeft:
+		if a.replayEditCursor > 0 {
+			a.replayEditCursor--
+		}
+		return nil
+
+	case tea.KeyRight:
+		if a.replayEditCursor < len(a.replayEditInput) {
+			a.replayEditCursor++
+		}
+		return nil
+
+	case tea.KeyRunes:
+		char := string(msg.Runes)
+		a.replayEditInput = a.replayEditInput[:a.replayEditCursor] + char + a.replayEditInput[a.replayEditCursor:]
+		a.replayEditCursor += len(char)
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleReplayEditHeaders(msg tea.KeyMsg) tea.Cmd {
+	// Headers list: each header + [Add New] + [Done]
+	totalItems := len(a.replayEditHeaders) + 2
+
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 2
+		return nil
+
+	case tea.KeyEnter:
+		if a.replayEditSelected < len(a.replayEditHeaders) {
+			// Edit existing header
+			a.replayHeaderIdx = a.replayEditSelected
+			a.replayHeaderField = "key"
+			a.replayEditInput = a.replayEditHeaders[a.replayHeaderIdx].Key
+			a.replayEditCursor = len(a.replayEditInput)
+			a.replayEditStep = ReplayEditStepHeaderEdit
+		} else if a.replayEditSelected == len(a.replayEditHeaders) {
+			// Add new header
+			a.replayEditHeaders = append(a.replayEditHeaders, HeaderEntry{Key: "", Value: ""})
+			a.replayHeaderIdx = len(a.replayEditHeaders) - 1
+			a.replayHeaderField = "key"
+			a.replayEditInput = ""
+			a.replayEditCursor = 0
+			a.replayEditStep = ReplayEditStepHeaderEdit
+		} else {
+			// Done
+			a.replayEditStep = ReplayEditStepMain
+			a.replayEditSelected = 2
+		}
+		return nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		// Delete selected header
+		if a.replayEditSelected < len(a.replayEditHeaders) {
+			a.replayEditHeaders = append(a.replayEditHeaders[:a.replayEditSelected], a.replayEditHeaders[a.replayEditSelected+1:]...)
+			if a.replayEditSelected >= len(a.replayEditHeaders) && a.replayEditSelected > 0 {
+				a.replayEditSelected--
+			}
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.replayEditSelected > 0 {
+			a.replayEditSelected--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.replayEditSelected < totalItems-1 {
+			a.replayEditSelected++
+		}
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleReplayEditHeaderEdit(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.replayEditStep = ReplayEditStepHeaders
+		return nil
+
+	case tea.KeyEnter:
+		if a.replayHeaderField == "key" {
+			a.replayEditHeaders[a.replayHeaderIdx].Key = a.replayEditInput
+			a.replayHeaderField = "value"
+			a.replayEditInput = a.replayEditHeaders[a.replayHeaderIdx].Value
+			a.replayEditCursor = len(a.replayEditInput)
+		} else {
+			a.replayEditHeaders[a.replayHeaderIdx].Value = a.replayEditInput
+			a.replayEditStep = ReplayEditStepHeaders
+		}
+		return nil
+
+	case tea.KeyBackspace:
+		if len(a.replayEditInput) > 0 && a.replayEditCursor > 0 {
+			a.replayEditInput = a.replayEditInput[:a.replayEditCursor-1] + a.replayEditInput[a.replayEditCursor:]
+			a.replayEditCursor--
+		}
+		return nil
+
+	case tea.KeyLeft:
+		if a.replayEditCursor > 0 {
+			a.replayEditCursor--
+		}
+		return nil
+
+	case tea.KeyRight:
+		if a.replayEditCursor < len(a.replayEditInput) {
+			a.replayEditCursor++
+		}
+		return nil
+
+	case tea.KeyRunes:
+		char := string(msg.Runes)
+		a.replayEditInput = a.replayEditInput[:a.replayEditCursor] + char + a.replayEditInput[a.replayEditCursor:]
+		a.replayEditCursor += len(char)
+		return nil
+	}
+	return nil
+}
+
+func (a *App) handleReplayEditBody(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 3
+		return nil
+
+	case tea.KeyEnter:
+		// Enter adds newline
+		a.replayEditInput = a.replayEditInput[:a.replayEditCursor] + "\n" + a.replayEditInput[a.replayEditCursor:]
+		a.replayEditCursor++
+		return nil
+
+	case tea.KeyTab:
+		// Tab to confirm body editing
+		a.replayEditBody = a.replayEditInput
+		a.replayEditStep = ReplayEditStepMain
+		a.replayEditSelected = 3
+		return nil
+
+	case tea.KeyBackspace:
+		if len(a.replayEditInput) > 0 && a.replayEditCursor > 0 {
+			a.replayEditInput = a.replayEditInput[:a.replayEditCursor-1] + a.replayEditInput[a.replayEditCursor:]
+			a.replayEditCursor--
+		}
+		return nil
+
+	case tea.KeyLeft:
+		if a.replayEditCursor > 0 {
+			a.replayEditCursor--
+		}
+		return nil
+
+	case tea.KeyRight:
+		if a.replayEditCursor < len(a.replayEditInput) {
+			a.replayEditCursor++
+		}
+		return nil
+
+	case tea.KeyUp:
+		// Move cursor up one line
+		a.replayEditCursor = a.moveCursorVertical(a.replayEditInput, a.replayEditCursor, -1)
+		return nil
+
+	case tea.KeyDown:
+		// Move cursor down one line
+		a.replayEditCursor = a.moveCursorVertical(a.replayEditInput, a.replayEditCursor, 1)
+		return nil
+
+	case tea.KeyRunes:
+		char := string(msg.Runes)
+		a.replayEditInput = a.replayEditInput[:a.replayEditCursor] + char + a.replayEditInput[a.replayEditCursor:]
+		a.replayEditCursor += len(char)
+		return nil
+	}
+	return nil
+}
+
+// sendEditedRequest sends the edited request
+func (a *App) sendEditedRequest() tea.Cmd {
+	// Get base URL from tunnels
+	baseURL := ""
+	if len(a.tunnels) > 0 {
+		baseURL = a.tunnels[0].PublicURL
+	}
+	if baseURL == "" {
+		a.lastError = fmt.Errorf("no tunnel available")
+		a.focus = a.prevFocus
+		return nil
+	}
+
+	method := a.replayEditMethod
+	url := baseURL + a.replayEditPath
+	body := a.replayEditBody
+	headers := make(map[string]string)
+	for _, h := range a.replayEditHeaders {
+		if h.Key != "" {
+			headers[h.Key] = h.Value
+		}
+	}
+
+	// Exit edit mode
+	a.focus = a.prevFocus
+
+	return func() tea.Msg {
+		// Create HTTP request
+		var reqBody io.Reader
+		if body != "" {
+			reqBody = strings.NewReader(body)
+		}
+
+		req, err := http.NewRequest(method, url, reqBody)
+		if err != nil {
+			return messages.ErrorMsg{Err: fmt.Errorf("failed to create request: %w", err)}
+		}
+
+		// Set headers
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		// Send request
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return messages.ErrorMsg{Err: fmt.Errorf("request failed: %w", err)}
+		}
+		defer resp.Body.Close()
+
+		// Success - refresh requests to see the new one
+		return messages.ReplayMsg{RequestID: "edited", Err: nil}
+	}
+}
+
+// indexOf finds the index of a string in a slice
+func indexOf(slice []string, item string) int {
+	for i, s := range slice {
+		if s == item {
+			return i
+		}
+	}
+	return 0
+}
+
+// moveCursorVertical moves cursor up or down in multiline text
+func (a *App) moveCursorVertical(text string, cursor int, direction int) int {
+	if text == "" {
+		return 0
+	}
+
+	// Find current line and column
+	lines := strings.Split(text, "\n")
+	currentLine := 0
+	currentCol := cursor
+	charCount := 0
+
+	for i, line := range lines {
+		lineLen := len(line)
+		if i < len(lines)-1 {
+			lineLen++ // account for newline
+		}
+		if charCount+lineLen > cursor {
+			currentLine = i
+			currentCol = cursor - charCount
+			break
+		}
+		charCount += lineLen
+	}
+
+	// Calculate target line
+	targetLine := currentLine + direction
+	if targetLine < 0 {
+		targetLine = 0
+	}
+	if targetLine >= len(lines) {
+		targetLine = len(lines) - 1
+	}
+
+	// Calculate new cursor position
+	newCursor := 0
+	for i := 0; i < targetLine; i++ {
+		newCursor += len(lines[i]) + 1 // +1 for newline
+	}
+
+	// Try to maintain column position
+	targetCol := currentCol
+	if targetCol > len(lines[targetLine]) {
+		targetCol = len(lines[targetLine])
+	}
+	newCursor += targetCol
+
+	if newCursor > len(text) {
+		newCursor = len(text)
+	}
+
+	return newCursor
+}
+
+// initHistoryView initializes the history view
+func (a *App) initHistoryView() {
+	if a.storage == nil {
+		return
+	}
+
+	a.historySelectedSess = 0
+
+	// Load sessions (exclude current session)
+	sessions, err := a.storage.GetSessions()
+	if err == nil {
+		// Filter out current session
+		a.historySessions = nil
+		for _, s := range sessions {
+			if s.ID != a.storage.CurrentSessionID() {
+				a.historySessions = append(a.historySessions, s)
+			}
+		}
+	}
+}
+
+// handleHistoryInput handles keyboard input in history view
+func (a *App) handleHistoryInput(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.focus = a.prevFocus
+		return nil
+
+	case tea.KeyEnter:
+		if len(a.historySessions) > 0 {
+			// Load selected session's requests into main view
+			sess := a.historySessions[a.historySelectedSess]
+			a.loadHistoricalSession(sess.ID)
+			a.focus = FocusList
+		}
+		return nil
+
+	case tea.KeyUp:
+		if a.historySelectedSess > 0 {
+			a.historySelectedSess--
+		}
+		return nil
+
+	case tea.KeyDown:
+		if a.historySelectedSess < len(a.historySessions)-1 {
+			a.historySelectedSess++
+		}
+		return nil
+
+	case tea.KeyRunes:
+		switch string(msg.Runes) {
+		case "j":
+			if a.historySelectedSess < len(a.historySessions)-1 {
+				a.historySelectedSess++
+			}
+		case "k":
+			if a.historySelectedSess > 0 {
+				a.historySelectedSess--
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+// loadHistoricalSession loads a historical session into the main view
+func (a *App) loadHistoricalSession(sessionID string) {
+	if a.storage == nil {
+		return
+	}
+
+	histReqs, err := a.storage.GetSessionRequests(sessionID)
+	if err != nil {
+		return
+	}
+
+	// Convert storage.HistoryRequest to ngrok.Request for display
+	a.requests = nil
+	for _, hr := range histReqs {
+		req := ngrok.Request{
+			ID:       hr.ID,
+			Start:    hr.Timestamp,
+			Duration: hr.DurationMS * 1_000_000, // ms to ns
+			Request: ngrok.HTTPData{
+				Method:  hr.Method,
+				URI:     hr.Path,
+				Headers: hr.ReqHeaders,
+			},
+			Response: ngrok.HTTPData{
+				StatusCode: hr.StatusCode,
+				Headers:    hr.ResHeaders,
+			},
+		}
+		// Store body data for later retrieval
+		req.Request.Raw = hr.ReqBody
+		req.Response.Raw = hr.ResBody
+		a.requests = append(a.requests, req)
+	}
+
+	a.viewingHistory = true
+	a.viewingSessionID = sessionID
+	a.selected = 0
+	a.applyFilters()
+	a.updateDetailViewport()
+}
+
+// exitHistoryView returns to live view
+func (a *App) exitHistoryView() {
+	a.viewingHistory = false
+	a.viewingSessionID = ""
+	// Requests will be refreshed on next poll
+}
+
+// initDiffView initializes the diff view
+func (a *App) initDiffView() {
+	a.diffViewport = viewport.New(0, 0)
+	a.diffViewport.Style = lipgloss.NewStyle()
+}
+
+// handleDiffInput handles keyboard input in diff view
+func (a *App) handleDiffInput(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		a.diffRequestA = nil
+		a.diffRequestB = nil
+		a.focus = a.prevFocus
+		return nil
+
+	case tea.KeyUp, tea.KeyRunes:
+		if msg.Type == tea.KeyRunes && string(msg.Runes) == "k" {
+			a.diffViewport.LineUp(1)
+		} else if msg.Type == tea.KeyUp {
+			a.diffViewport.LineUp(1)
+		}
+		return nil
+
+	case tea.KeyDown:
+		a.diffViewport.LineDown(1)
+		return nil
+	}
+
+	if msg.Type == tea.KeyRunes {
+		switch string(msg.Runes) {
+		case "j":
+			a.diffViewport.LineDown(1)
+		case "g":
+			a.diffViewport.GotoTop()
+		case "G":
+			a.diffViewport.GotoBottom()
+		}
+	}
+	return nil
+}
+
+// generateDiff generates a diff between two requests
+func (a *App) generateDiff() string {
+	if a.diffRequestA == nil || a.diffRequestB == nil {
+		return "No requests selected for diff"
+	}
+
+	reqA := a.diffRequestA
+	reqB := a.diffRequestB
+
+	var sb strings.Builder
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary)
+	addedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981"))   // green
+	removedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")) // red
+	unchangedStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+	labelStyle := lipgloss.NewStyle().Bold(true)
+
+	sb.WriteString(titleStyle.Render("Request Diff"))
+	sb.WriteString("\n")
+	timeA := reqA.Start.Format("15:04:05")
+	timeB := reqB.Start.Format("15:04:05")
+	sb.WriteString(fmt.Sprintf("A: %s %s (%s)\n", reqA.Request.Method, reqA.Request.URI, timeA))
+	sb.WriteString(fmt.Sprintf("B: %s %s (%s)\n", reqB.Request.Method, reqB.Request.URI, timeB))
+	sb.WriteString("\n")
+
+	// Method diff
+	sb.WriteString(labelStyle.Render("Method: "))
+	if reqA.Request.Method != reqB.Request.Method {
+		sb.WriteString(removedStyle.Render("- "+reqA.Request.Method) + " ")
+		sb.WriteString(addedStyle.Render("+ " + reqB.Request.Method))
+	} else {
+		sb.WriteString(unchangedStyle.Render(reqA.Request.Method))
+	}
+	sb.WriteString("\n")
+
+	// Path diff
+	sb.WriteString(labelStyle.Render("Path: "))
+	if reqA.Request.URI != reqB.Request.URI {
+		sb.WriteString("\n")
+		sb.WriteString(removedStyle.Render("  - "+reqA.Request.URI) + "\n")
+		sb.WriteString(addedStyle.Render("  + " + reqB.Request.URI))
+	} else {
+		sb.WriteString(unchangedStyle.Render(reqA.Request.URI))
+	}
+	sb.WriteString("\n")
+
+	// Status diff
+	sb.WriteString(labelStyle.Render("Status: "))
+	statusCodeA := reqA.StatusCode()
+	statusCodeB := reqB.StatusCode()
+	statusA := fmt.Sprintf("%d %s", statusCodeA, httpStatusText(statusCodeA))
+	statusB := fmt.Sprintf("%d %s", statusCodeB, httpStatusText(statusCodeB))
+	if statusA != statusB {
+		sb.WriteString(removedStyle.Render("- "+statusA) + " ")
+		sb.WriteString(addedStyle.Render("+ " + statusB))
+	} else {
+		sb.WriteString(unchangedStyle.Render(statusA))
+	}
+	sb.WriteString("\n")
+
+	// Duration diff
+	sb.WriteString(labelStyle.Render("Duration: "))
+	durA := fmt.Sprintf("%dms", reqA.Duration/1_000_000)
+	durB := fmt.Sprintf("%dms", reqB.Duration/1_000_000)
+	if durA != durB {
+		sb.WriteString(removedStyle.Render("- "+durA) + " ")
+		sb.WriteString(addedStyle.Render("+ " + durB))
+	} else {
+		sb.WriteString(unchangedStyle.Render(durA))
+	}
+	sb.WriteString("\n\n")
+
+	// Request Headers diff
+	sb.WriteString(labelStyle.Render("Request Headers:"))
+	sb.WriteString("\n")
+	sb.WriteString(a.diffHeaders(reqA.Request.Headers, reqB.Request.Headers, addedStyle, removedStyle, unchangedStyle))
+	sb.WriteString("\n")
+
+	// Request Body diff
+	bodyA := reqA.Request.DecodeBody()
+	bodyB := reqB.Request.DecodeBody()
+	if bodyA != "" || bodyB != "" {
+		sb.WriteString(labelStyle.Render("Request Body:"))
+		sb.WriteString("\n")
+		sb.WriteString(a.diffText(bodyA, bodyB, addedStyle, removedStyle, unchangedStyle))
+		sb.WriteString("\n")
+	}
+
+	// Response Headers diff
+	sb.WriteString(labelStyle.Render("Response Headers:"))
+	sb.WriteString("\n")
+	sb.WriteString(a.diffHeaders(reqA.Response.Headers, reqB.Response.Headers, addedStyle, removedStyle, unchangedStyle))
+	sb.WriteString("\n")
+
+	// Response Body diff
+	respBodyA := reqA.Response.DecodeBody()
+	respBodyB := reqB.Response.DecodeBody()
+	if respBodyA != "" || respBodyB != "" {
+		sb.WriteString(labelStyle.Render("Response Body:"))
+		sb.WriteString("\n")
+		sb.WriteString(a.diffText(respBodyA, respBodyB, addedStyle, removedStyle, unchangedStyle))
+	}
+
+	return sb.String()
+}
+
+// diffHeaders generates a diff for headers
+func (a *App) diffHeaders(headersA, headersB map[string][]string, addedStyle, removedStyle, unchangedStyle lipgloss.Style) string {
+	var sb strings.Builder
+
+	// Collect all keys
+	allKeys := make(map[string]bool)
+	for k := range headersA {
+		allKeys[k] = true
+	}
+	for k := range headersB {
+		allKeys[k] = true
+	}
+
+	// Sort keys
+	var keys []string
+	for k := range allKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		valsA := headersA[k]
+		valsB := headersB[k]
+
+		valA := strings.Join(valsA, ", ")
+		valB := strings.Join(valsB, ", ")
+
+		if len(valsA) == 0 {
+			// Added in B
+			sb.WriteString(addedStyle.Render(fmt.Sprintf("  + %s: %s", k, valB)))
+			sb.WriteString("\n")
+		} else if len(valsB) == 0 {
+			// Removed in B
+			sb.WriteString(removedStyle.Render(fmt.Sprintf("  - %s: %s", k, valA)))
+			sb.WriteString("\n")
+		} else if valA != valB {
+			// Changed
+			sb.WriteString(removedStyle.Render(fmt.Sprintf("  - %s: %s", k, valA)))
+			sb.WriteString("\n")
+			sb.WriteString(addedStyle.Render(fmt.Sprintf("  + %s: %s", k, valB)))
+			sb.WriteString("\n")
+		} else {
+			// Unchanged
+			sb.WriteString(unchangedStyle.Render(fmt.Sprintf("    %s: %s", k, valA)))
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String()
+}
+
+// diffText generates a simple line-by-line diff for text content
+func (a *App) diffText(textA, textB string, addedStyle, removedStyle, unchangedStyle lipgloss.Style) string {
+	if textA == textB {
+		// Show truncated if same
+		if len(textA) > 200 {
+			return unchangedStyle.Render("  (identical, " + fmt.Sprintf("%d bytes", len(textA)) + ")\n")
+		}
+		lines := strings.Split(textA, "\n")
+		var sb strings.Builder
+		for _, line := range lines {
+			sb.WriteString(unchangedStyle.Render("    " + line))
+			sb.WriteString("\n")
+		}
+		return sb.String()
+	}
+
+	linesA := strings.Split(textA, "\n")
+	linesB := strings.Split(textB, "\n")
+
+	var sb strings.Builder
+
+	// Simple line-by-line comparison (not a full diff algorithm)
+	maxLines := len(linesA)
+	if len(linesB) > maxLines {
+		maxLines = len(linesB)
+	}
+
+	// Limit output for very long diffs
+	if maxLines > 50 {
+		sb.WriteString(fmt.Sprintf("  (showing first 50 of %d lines)\n", maxLines))
+		maxLines = 50
+	}
+
+	for i := 0; i < maxLines; i++ {
+		lineA := ""
+		lineB := ""
+		if i < len(linesA) {
+			lineA = linesA[i]
+		}
+		if i < len(linesB) {
+			lineB = linesB[i]
+		}
+
+		if lineA == lineB {
+			sb.WriteString(unchangedStyle.Render("    " + lineA))
+			sb.WriteString("\n")
+		} else {
+			if lineA != "" {
+				sb.WriteString(removedStyle.Render("  - " + lineA))
+				sb.WriteString("\n")
+			}
+			if lineB != "" {
+				sb.WriteString(addedStyle.Render("  + " + lineB))
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	return sb.String()
 }
 
 // performSearch applies search and resets selection
@@ -662,87 +1776,139 @@ func (a *App) matchesSearch(req ngrok.Request, query string) bool {
 	return false
 }
 
-// matchesAllFilters checks if a request matches all active filters
+// matchesAllFilters checks if a request matches all active filters with AND/OR logic
 func (a *App) matchesAllFilters(req ngrok.Request) bool {
-	for _, f := range a.activeFilters {
-		if !a.matchesFilter(req, f) {
-			return false
+	if len(a.activeFilters) == 0 {
+		return true
+	}
+
+	// Process filters with AND/OR logic
+	result := a.matchesFilter(req, a.activeFilters[0])
+
+	for i := 1; i < len(a.activeFilters); i++ {
+		prevFilter := a.activeFilters[i-1]
+		currentMatch := a.matchesFilter(req, a.activeFilters[i])
+
+		if prevFilter.LogicalOperator == "||" {
+			result = result || currentMatch
+		} else {
+			// Default to AND
+			result = result && currentMatch
 		}
 	}
-	return true
+
+	return result
 }
 
 // matchesFilter checks if a request matches a single filter
 func (a *App) matchesFilter(req ngrok.Request, f Filter) bool {
 	switch f.Field {
 	case "status":
-		return a.compareNumeric(req.StatusCode(), f.Operator, f.Value)
-	case "method":
-		return a.compareString(req.Request.Method, f.Operator, f.Value)
+		return a.compareStringOp(fmt.Sprintf("%d", req.StatusCode()), f.Operator, f.Value)
 	case "path":
-		return a.compareString(req.Request.URI, f.Operator, f.Value)
+		return a.compareStringOp(req.Request.URI, f.Operator, f.Value)
 	case "duration":
-		return a.compareFloat(req.DurationMs(), f.Operator, f.Value)
+		return a.compareDuration(req.DurationMs(), f.Operator, f.Unit, f.Value)
+	case "response_size":
+		return a.compareSize(req.ResponseSize(), f.Operator, f.Unit, f.Value)
+	default:
+		// Handle headers
+		if strings.HasPrefix(f.Field, "header.") {
+			headerName := strings.TrimPrefix(f.Field, "header.")
+			headerValue := a.getHeaderValue(req, headerName)
+			return a.compareStringOp(headerValue, f.Operator, f.Value)
+		}
 	}
 	return true
 }
 
-func (a *App) compareNumeric(val int, op string, target string) bool {
-	t, err := strconv.Atoi(target)
-	if err != nil {
-		return false
+// getHeaderValue gets a header value from request (case-insensitive)
+func (a *App) getHeaderValue(req ngrok.Request, headerName string) string {
+	headerName = strings.ToLower(headerName)
+	for k, vals := range req.Request.Headers {
+		if strings.ToLower(k) == headerName && len(vals) > 0 {
+			return vals[0]
+		}
 	}
+	return ""
+}
+
+// compareStringOp compares strings with operators ==, !=, match, !match
+func (a *App) compareStringOp(val string, op string, target string) bool {
 	switch op {
-	case "=":
-		return val == t
+	case "==":
+		return val == target
 	case "!=":
-		return val != t
-	case ">":
-		return val > t
-	case "<":
-		return val < t
-	case ">=":
-		return val >= t
-	case "<=":
-		return val <= t
+		return val != target
+	case "match":
+		return strings.Contains(strings.ToLower(val), strings.ToLower(target))
+	case "!match":
+		return !strings.Contains(strings.ToLower(val), strings.ToLower(target))
 	}
 	return false
 }
 
-func (a *App) compareFloat(val float64, op string, target string) bool {
+// compareDuration compares duration with unit conversion
+func (a *App) compareDuration(valMs float64, op string, unit string, target string) bool {
 	t, err := strconv.ParseFloat(target, 64)
 	if err != nil {
 		return false
 	}
-	switch op {
-	case "=":
-		return val == t
-	case ">":
-		return val > t
-	case "<":
-		return val < t
-	case ">=":
-		return val >= t
-	case "<=":
-		return val <= t
+
+	// Convert target to milliseconds based on unit
+	var targetMs float64
+	switch unit {
+	case "ms":
+		targetMs = t
+	case "s":
+		targetMs = t * 1000
+	case "m":
+		targetMs = t * 60 * 1000
+	case "h":
+		targetMs = t * 60 * 60 * 1000
+	case "d":
+		targetMs = t * 24 * 60 * 60 * 1000
+	default:
+		targetMs = t
 	}
-	return false
+
+	return a.compareFloat(valMs, op, targetMs)
 }
 
-func (a *App) compareString(val string, op string, target string) bool {
-	val = strings.ToLower(val)
-	target = strings.ToLower(target)
+// compareSize compares size with unit conversion
+func (a *App) compareSize(valBytes int, op string, unit string, target string) bool {
+	t, err := strconv.ParseFloat(target, 64)
+	if err != nil {
+		return false
+	}
+
+	// Convert target to bytes based on unit
+	var targetBytes float64
+	switch unit {
+	case "b":
+		targetBytes = t
+	case "kb":
+		targetBytes = t * 1024
+	case "mb":
+		targetBytes = t * 1024 * 1024
+	default:
+		targetBytes = t
+	}
+
+	return a.compareFloat(float64(valBytes), op, targetBytes)
+}
+
+// compareFloat compares two float values
+func (a *App) compareFloat(val float64, op string, target float64) bool {
 	switch op {
-	case "=":
-		return val == target
-	case "!=":
-		return val != target
-	case "contains":
-		return strings.Contains(val, target)
-	case "starts":
-		return strings.HasPrefix(val, target)
-	case "ends":
-		return strings.HasSuffix(val, target)
+	case ">":
+		return val > target
+	case "<":
+		return val < target
+	case ">=":
+		return val >= target
+	case "<=":
+		return val <= target
 	}
 	return false
 }
@@ -766,10 +1932,10 @@ func (a *App) copyAsCurl(req ngrok.Request) tea.Cmd {
 	if len(a.tunnels) > 0 {
 		baseURL = a.tunnels[0].PublicURL
 	}
-	
+
 	return func() tea.Msg {
 		curl := buildCurlCommand(req, baseURL)
-		
+
 		// Try to copy to clipboard using system command
 		var cmd *exec.Cmd
 		switch runtime.GOOS {
@@ -848,7 +2014,15 @@ func (a *App) View() string {
 // renderHeader renders the top header with tunnel info
 func (a *App) renderHeader() string {
 	var tunnelInfo string
-	if len(a.tunnels) > 0 {
+
+	if a.viewingHistory {
+		// Show history mode indicator
+		tunnelInfo = lipgloss.NewStyle().
+			Background(lipgloss.Color("#7C3AED")).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Padding(0, 1).
+			Render(" 📜 Viewing History - press 'h' to return to live ")
+	} else if len(a.tunnels) > 0 {
 		t := a.tunnels[0]
 		tunnelInfo = fmt.Sprintf(" %s → %s ",
 			TunnelURLStyle.Render(t.PublicURL),
@@ -861,10 +2035,15 @@ func (a *App) renderHeader() string {
 	}
 
 	title := HeaderStyle.Render(" 🕳 MOLE ")
-	info := lipgloss.NewStyle().
-		Background(lipgloss.Color("#1F2937")).
-		Padding(0, 1).
-		Render(tunnelInfo)
+	var info string
+	if a.viewingHistory {
+		info = tunnelInfo
+	} else {
+		info = lipgloss.NewStyle().
+			Background(lipgloss.Color("#1F2937")).
+			Padding(0, 1).
+			Render(tunnelInfo)
+	}
 
 	headerContent := lipgloss.JoinHorizontal(lipgloss.Center, title, info)
 
@@ -876,6 +2055,11 @@ func (a *App) renderHeader() string {
 // renderContent renders the main content area
 func (a *App) renderContent() string {
 	contentHeight := a.height - 4 // header + footer
+
+	// History view takes full screen
+	if a.focus == FocusHistory {
+		return a.renderHistoryView(a.width, contentHeight)
+	}
 
 	// Responsive layout
 	if a.width >= 120 {
@@ -904,9 +2088,9 @@ func (a *App) renderSideBySide(height int) string {
 	// Highlight focused panel
 	listBorder := BorderStyle
 	detailBorder := BorderStyle
-	if a.focus == FocusList || a.focus == FocusFilter {
+	if a.focus == FocusList || a.focus == FocusFilter || a.focus == FocusReplayEdit {
 		listBorder = ActiveBorderStyle
-	} else if a.focus == FocusDetailPanel {
+	} else if a.focus == FocusDetailPanel || a.focus == FocusDiff {
 		detailBorder = ActiveBorderStyle
 	}
 
@@ -936,9 +2120,9 @@ func (a *App) renderStacked(height int) string {
 	// Highlight focused panel
 	listBorder := BorderStyle
 	detailBorder := BorderStyle
-	if a.focus == FocusList || a.focus == FocusFilter {
+	if a.focus == FocusList || a.focus == FocusFilter || a.focus == FocusReplayEdit {
 		listBorder = ActiveBorderStyle
-	} else if a.focus == FocusDetailPanel {
+	} else if a.focus == FocusDetailPanel || a.focus == FocusDiff {
 		detailBorder = ActiveBorderStyle
 	}
 
@@ -953,6 +2137,11 @@ func (a *App) renderRequestList(width, height int) string {
 	// If in filter mode, show filter UI at top
 	if a.focus == FocusFilter {
 		return a.renderFilterInPanel(width, height)
+	}
+
+	// If in replay edit mode, show edit UI
+	if a.focus == FocusReplayEdit {
+		return a.renderReplayEditInPanel(width, height)
 	}
 
 	if len(a.requests) == 0 {
@@ -1006,9 +2195,25 @@ func (a *App) renderFilterInPanel(width, height int) string {
 	mutedStyle := lipgloss.NewStyle().Foreground(ColorMuted)
 	selectedStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
 
+	// Show current filter chain being built
+	if len(a.activeFilters) > 0 {
+		var filterChain string
+		for i, f := range a.activeFilters {
+			if i > 0 {
+				filterChain += " "
+			}
+			filterChain += a.formatFilterBadge(f)
+			if f.LogicalOperator != "" {
+				filterChain += " " + f.LogicalOperator
+			}
+		}
+		lines = append(lines, mutedStyle.Render("Current: ")+filterChain)
+		lines = append(lines, "")
+	}
+
 	switch a.filterStep {
 	case FilterStepField:
-		lines = append(lines, titleStyle.Render("Add Filter"))
+		lines = append(lines, titleStyle.Render("Select Field"))
 		lines = append(lines, "")
 
 		if a.filterInput != "" {
@@ -1016,7 +2221,19 @@ func (a *App) renderFilterInPanel(width, height int) string {
 			lines = append(lines, "")
 		}
 
-		for i, f := range a.filteredFields {
+		// Show limited number of fields to fit in panel
+		maxVisible := height - 6
+		if maxVisible < 5 {
+			maxVisible = 5
+		}
+		startIdx := 0
+		if a.filterSelected >= maxVisible {
+			startIdx = a.filterSelected - maxVisible + 1
+		}
+		endIdx := min(startIdx+maxVisible, len(a.filteredFields))
+
+		for i := startIdx; i < endIdx; i++ {
+			f := a.filteredFields[i]
 			if i == a.filterSelected {
 				lines = append(lines, selectedStyle.Render("▶ "+f.Name))
 			} else {
@@ -1044,18 +2261,239 @@ func (a *App) renderFilterInPanel(width, height int) string {
 			}
 		}
 
+	case FilterStepUnit:
+		field := a.getFieldByKey(a.pendingFilter.Field)
+		if field != nil {
+			lines = append(lines, titleStyle.Render("Select Unit"))
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("%s %s", field.Name, a.pendingFilter.Operator)))
+			lines = append(lines, "")
+
+			for i, unit := range field.Units {
+				if i == a.filterSelected {
+					lines = append(lines, selectedStyle.Render("▶ "+unit))
+				} else {
+					lines = append(lines, "  "+unit)
+				}
+			}
+		}
+
 	case FilterStepValue:
 		field := a.getFieldByKey(a.pendingFilter.Field)
 		if field != nil {
+			filterDesc := field.Name + " " + a.pendingFilter.Operator
+			if a.pendingFilter.Unit != "" {
+				filterDesc += " (" + a.pendingFilter.Unit + ")"
+			}
 			lines = append(lines, titleStyle.Render("Enter Value"))
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("%s %s ?", field.Name, a.pendingFilter.Operator)))
+			lines = append(lines, mutedStyle.Render(filterDesc))
 			lines = append(lines, "")
 			lines = append(lines, "> "+a.filterInput+"█")
+		}
+
+	case FilterStepLogical:
+		field := a.getFieldByKey(a.pendingFilter.Field)
+		if field != nil {
+			filterDesc := a.formatFilterBadge(a.pendingFilter)
+			lines = append(lines, titleStyle.Render("Add Another Filter?"))
+			lines = append(lines, mutedStyle.Render("Filter: "+filterDesc))
+			lines = append(lines, "")
+
+			options := []string{"Done (apply filter)", "&& (AND another)", "|| (OR another)"}
+			for i, opt := range options {
+				if i == a.filterSelected {
+					lines = append(lines, selectedStyle.Render("▶ "+opt))
+				} else {
+					lines = append(lines, "  "+opt)
+				}
+			}
 		}
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("↑↓: select  Enter: confirm  Esc: cancel"))
+	lines = append(lines, mutedStyle.Render("↑↓: select  Enter: confirm  Esc: back"))
+
+	return strings.Join(lines, "\n")
+}
+
+// formatFilterBadge formats a filter as a display string
+func (a *App) formatFilterBadge(f Filter) string {
+	result := f.Field + " " + f.Operator
+	if f.Unit != "" {
+		result += " " + f.Value + f.Unit
+	} else {
+		result += " " + f.Value
+	}
+	return result
+}
+
+// renderReplayEditInPanel renders the replay edit UI inside the request list panel
+func (a *App) renderReplayEditInPanel(width, height int) string {
+	var lines []string
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary)
+	mutedStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+	selectedStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981"))
+
+	switch a.replayEditStep {
+	case ReplayEditStepMain:
+		lines = append(lines, titleStyle.Render("Replay with Edit"))
+		lines = append(lines, "")
+
+		menuItems := []struct {
+			label string
+			value string
+		}{
+			{"Method", a.replayEditMethod},
+			{"Path", a.replayEditPath},
+			{"Headers", fmt.Sprintf("(%d)", len(a.replayEditHeaders))},
+			{"Body", fmt.Sprintf("(%d bytes)", len(a.replayEditBody))},
+			{"► Send Request", ""},
+			{"✕ Cancel", ""},
+		}
+
+		for i, item := range menuItems {
+			line := ""
+			if i == a.replayEditSelected {
+				line = selectedStyle.Render("▶ " + item.label)
+			} else {
+				line = "  " + item.label
+			}
+			if item.value != "" {
+				line += "  " + valueStyle.Render(item.value)
+			}
+			lines = append(lines, line)
+		}
+
+	case ReplayEditStepMethod:
+		lines = append(lines, titleStyle.Render("Select Method"))
+		lines = append(lines, "")
+
+		for i, method := range httpMethods {
+			if i == a.replayEditSelected {
+				lines = append(lines, selectedStyle.Render("▶ "+method))
+			} else {
+				lines = append(lines, "  "+method)
+			}
+		}
+
+	case ReplayEditStepPath:
+		lines = append(lines, titleStyle.Render("Edit Path"))
+		lines = append(lines, "")
+		// Show input with cursor
+		input := a.replayEditInput
+		if a.replayEditCursor < len(input) {
+			input = input[:a.replayEditCursor] + "█" + input[a.replayEditCursor:]
+		} else {
+			input = input + "█"
+		}
+		lines = append(lines, "> "+input)
+
+	case ReplayEditStepHeaders:
+		lines = append(lines, titleStyle.Render("Edit Headers"))
+		lines = append(lines, mutedStyle.Render("Enter: edit  Backspace: delete"))
+		lines = append(lines, "")
+
+		maxVisible := height - 6
+		if maxVisible < 3 {
+			maxVisible = 3
+		}
+
+		totalItems := len(a.replayEditHeaders) + 2
+		startIdx := 0
+		if a.replayEditSelected >= maxVisible {
+			startIdx = a.replayEditSelected - maxVisible + 1
+		}
+		endIdx := min(startIdx+maxVisible, totalItems)
+
+		for i := startIdx; i < endIdx; i++ {
+			var line string
+			if i < len(a.replayEditHeaders) {
+				h := a.replayEditHeaders[i]
+				headerStr := h.Key + ": " + h.Value
+				if len(headerStr) > width-4 {
+					headerStr = headerStr[:width-7] + "..."
+				}
+				if i == a.replayEditSelected {
+					line = selectedStyle.Render("▶ " + headerStr)
+				} else {
+					line = "  " + headerStr
+				}
+			} else if i == len(a.replayEditHeaders) {
+				if i == a.replayEditSelected {
+					line = selectedStyle.Render("▶ [Add New Header]")
+				} else {
+					line = "  [Add New Header]"
+				}
+			} else {
+				if i == a.replayEditSelected {
+					line = selectedStyle.Render("▶ [Done]")
+				} else {
+					line = "  [Done]"
+				}
+			}
+			lines = append(lines, line)
+		}
+
+	case ReplayEditStepHeaderEdit:
+		fieldName := "Key"
+		if a.replayHeaderField == "value" {
+			fieldName = "Value"
+		}
+		lines = append(lines, titleStyle.Render("Edit Header "+fieldName))
+		lines = append(lines, "")
+		input := a.replayEditInput
+		if a.replayEditCursor < len(input) {
+			input = input[:a.replayEditCursor] + "█" + input[a.replayEditCursor:]
+		} else {
+			input = input + "█"
+		}
+		lines = append(lines, "> "+input)
+
+	case ReplayEditStepBody:
+		lines = append(lines, titleStyle.Render("Edit Body"))
+		lines = append(lines, "")
+
+		// Show body with cursor at position
+		input := a.replayEditInput
+		cursorPos := a.replayEditCursor
+		if cursorPos > len(input) {
+			cursorPos = len(input)
+		}
+
+		// Insert cursor character at position
+		var displayText string
+		if cursorPos < len(input) {
+			displayText = input[:cursorPos] + "█" + input[cursorPos:]
+		} else {
+			displayText = input + "█"
+		}
+
+		// Split into lines and display
+		bodyLines := strings.Split(displayText, "\n")
+		maxBodyLines := height - 5
+		if maxBodyLines < 3 {
+			maxBodyLines = 3
+		}
+
+		for i, bl := range bodyLines {
+			if i >= maxBodyLines {
+				lines = append(lines, mutedStyle.Render(fmt.Sprintf("... (%d more lines)", len(bodyLines)-maxBodyLines)))
+				break
+			}
+			if len(bl) > width-2 {
+				bl = bl[:width-5] + "..."
+			}
+			lines = append(lines, bl)
+		}
+
+		lines = append(lines, "")
+		lines = append(lines, mutedStyle.Render("Tab: save  Esc: cancel"))
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("↑↓: select  Enter: confirm  Esc: back"))
 
 	return strings.Join(lines, "\n")
 }
@@ -1065,10 +2503,19 @@ func (a *App) renderRequestLine(req ngrok.Request, width int, selected bool) str
 	statusCode := req.StatusCode()
 	timeAgo := formatRelativeTime(req.Start)
 
+	// Check if this is a diff-selected request
+	isDiffA := a.diffRequestA != nil && a.diffRequestA.ID == req.ID
+	isDiffB := a.diffRequestB != nil && a.diffRequestB.ID == req.ID
+
 	// Compact format: "▶ METHOD  STATUS PATH         TIME"
 	// Widths:          2  8       4     var          6
 	// METHOD is 8 chars to fit "OPTIONS" (7) + space
-	fixedWidth := 2 + 8 + 4 + 6
+	// Extra 4 chars for [A]/[B] marker when diff is active
+	extraWidth := 0
+	if a.diffRequestA != nil || a.diffRequestB != nil {
+		extraWidth = 4
+	}
+	fixedWidth := 2 + 8 + 4 + 6 + extraWidth
 	pathWidth := width - fixedWidth
 	if pathWidth < 8 {
 		pathWidth = 8
@@ -1082,6 +2529,18 @@ func (a *App) renderRequestLine(req ngrok.Request, width int, selected bool) str
 		indicator = lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("▶ ")
 	} else {
 		indicator = "  "
+	}
+
+	// Add diff marker
+	var diffMarker string
+	if a.diffRequestA != nil || a.diffRequestB != nil {
+		if isDiffA {
+			diffMarker = lipgloss.NewStyle().Foreground(lipgloss.Color("#FBBF24")).Bold(true).Render("[A] ")
+		} else if isDiffB {
+			diffMarker = lipgloss.NewStyle().Foreground(lipgloss.Color("#60A5FA")).Bold(true).Render("[B] ")
+		} else {
+			diffMarker = "    "
+		}
 	}
 
 	// Apply highlighting if search is active
@@ -1117,7 +2576,7 @@ func (a *App) renderRequestLine(req ngrok.Request, width int, selected bool) str
 		Align(lipgloss.Right).
 		Render(timeAgo)
 
-	return fmt.Sprintf("%s%s%s%s%s", indicator, method, status, path, time)
+	return fmt.Sprintf("%s%s%s%s%s%s", indicator, diffMarker, method, status, path, time)
 }
 
 // highlightText highlights search query matches in text with yellow background
@@ -1227,6 +2686,11 @@ func httpStatusText(code int) string {
 
 // renderDetailPanel renders the detail panel (side panel mode)
 func (a *App) renderDetailPanel(width, height int) string {
+	// If in diff mode, show diff view
+	if a.focus == FocusDiff {
+		return a.renderDiffView(width, height)
+	}
+
 	if len(a.filteredReqs) == 0 || a.selected >= len(a.filteredReqs) {
 		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center,
 			"Select a request to view details")
@@ -1234,6 +2698,90 @@ func (a *App) renderDetailPanel(width, height int) string {
 
 	// Use viewport for scrollable content
 	return a.detailViewport.View()
+}
+
+// renderDiffView renders the diff comparison view
+func (a *App) renderDiffView(width, height int) string {
+	if a.diffRequestA == nil || a.diffRequestB == nil {
+		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center,
+			"No diff to display")
+	}
+
+	// Update viewport size if needed
+	if a.diffViewport.Width != width || a.diffViewport.Height != height {
+		a.diffViewport.Width = width
+		a.diffViewport.Height = height
+	}
+
+	// Generate diff content
+	content := a.generateDiff()
+
+	// Wrap content to fit width
+	wrappedContent := lipgloss.NewStyle().Width(width).Render(content)
+	a.diffViewport.SetContent(wrappedContent)
+
+	return a.diffViewport.View()
+}
+
+// renderHistoryView renders the history browser view
+func (a *App) renderHistoryView(width, height int) string {
+	if a.storage == nil {
+		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center,
+			"Storage not available")
+	}
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary)
+	selectedStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
+	mutedStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+
+	var lines []string
+
+	lines = append(lines, titleStyle.Render("History - Select Session"))
+	lines = append(lines, "")
+
+	if len(a.historySessions) == 0 {
+		lines = append(lines, mutedStyle.Render("No previous sessions found"))
+	} else {
+		maxVisible := height - 6
+		startIdx := 0
+		if a.historySelectedSess >= maxVisible {
+			startIdx = a.historySelectedSess - maxVisible + 1
+		}
+		endIdx := min(startIdx+maxVisible, len(a.historySessions))
+
+		for i := startIdx; i < endIdx; i++ {
+			sess := a.historySessions[i]
+			dateStr := sess.StartedAt.Format("Jan 02, 15:04")
+
+			// Count requests in session
+			reqs, _ := a.storage.GetSessionRequests(sess.ID)
+			reqCount := len(reqs)
+
+			line := fmt.Sprintf("%s (%d requests)", dateStr, reqCount)
+			if sess.TunnelURL != "" {
+				// Truncate URL if too long
+				url := sess.TunnelURL
+				maxURLLen := width - len(line) - 10
+				if maxURLLen > 20 && len(url) > maxURLLen {
+					url = url[:maxURLLen-3] + "..."
+				}
+				line += " - " + url
+			}
+
+			if i == a.historySelectedSess {
+				lines = append(lines, selectedStyle.Render("▶ "+line))
+			} else {
+				lines = append(lines, "  "+line)
+			}
+		}
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("j/k: nav  Enter: load session  Esc: back"))
+
+	content := strings.Join(lines, "\n")
+
+	return BorderStyle.Width(width - 2).Height(height - 2).Render(content)
 }
 
 // renderRequestDetail renders request details
@@ -1336,8 +2884,6 @@ func indentLines(text, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-
-
 // renderHeaders renders headers in sorted order to prevent flickering
 func (a *App) renderHeaders(headers map[string][]string) string {
 	if len(headers) == 0 {
@@ -1386,18 +2932,28 @@ func (a *App) renderFooter() string {
 		return HelpStyle.Width(a.width).Padding(0, 1).Render(searchLine + hint)
 	}
 
-
 	// Build status line with active filters and search
 	var statusParts []string
 
 	// Show active filters
-	for _, f := range a.activeFilters {
+	for i, f := range a.activeFilters {
+		// Format filter value with unit if present
+		value := f.Value
+		if f.Unit != "" {
+			value += f.Unit
+		}
 		badge := lipgloss.NewStyle().
 			Background(ColorPrimary).
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Padding(0, 1).
-			Render(fmt.Sprintf("%s %s %s", f.Field, f.Operator, f.Value))
+			Render(fmt.Sprintf("%s %s %s", f.Field, f.Operator, value))
 		statusParts = append(statusParts, badge)
+
+		// Show logical operator if not the last filter
+		if f.LogicalOperator != "" && i < len(a.activeFilters)-1 {
+			opStyle := lipgloss.NewStyle().Foreground(ColorWarning).Bold(true)
+			statusParts = append(statusParts, opStyle.Render(f.LogicalOperator))
+		}
 	}
 
 	// Show search query
@@ -1410,11 +2966,46 @@ func (a *App) renderFooter() string {
 		statusParts = append(statusParts, searchBadge)
 	}
 
+	// Show diff mode indicator
+	if a.diffRequestA != nil && a.focus != FocusDiff {
+		diffBadge := lipgloss.NewStyle().
+			Background(lipgloss.Color("#FBBF24")).
+			Foreground(lipgloss.Color("#000000")).
+			Padding(0, 1).
+			Render("Diff: [A] selected, press 'd' on another request")
+		statusParts = append(statusParts, diffBadge)
+	}
+
 	// Help text
 	var help string
 	if a.focus == FocusFilter {
 		help = fmt.Sprintf("%s select  %s confirm  %s cancel",
 			HelpKeyStyle.Render("↑↓"),
+			HelpKeyStyle.Render("enter"),
+			HelpKeyStyle.Render("esc"))
+	} else if a.focus == FocusReplayEdit {
+		if a.replayEditStep == ReplayEditStepBody {
+			help = fmt.Sprintf("%s save  %s cancel",
+				HelpKeyStyle.Render("tab"),
+				HelpKeyStyle.Render("esc"))
+		} else if a.replayEditStep == ReplayEditStepPath || a.replayEditStep == ReplayEditStepHeaderEdit {
+			help = fmt.Sprintf("%s move  %s confirm  %s cancel",
+				HelpKeyStyle.Render("←→"),
+				HelpKeyStyle.Render("enter"),
+				HelpKeyStyle.Render("esc"))
+		} else {
+			help = fmt.Sprintf("%s select  %s confirm  %s back/cancel",
+				HelpKeyStyle.Render("↑↓"),
+				HelpKeyStyle.Render("enter"),
+				HelpKeyStyle.Render("esc"))
+		}
+	} else if a.focus == FocusDiff {
+		help = fmt.Sprintf("%s scroll  %s close",
+			HelpKeyStyle.Render("j/k/mouse"),
+			HelpKeyStyle.Render("esc"))
+	} else if a.focus == FocusHistory {
+		help = fmt.Sprintf("%s nav  %s load session  %s back",
+			HelpKeyStyle.Render("j/k"),
 			HelpKeyStyle.Render("enter"),
 			HelpKeyStyle.Render("esc"))
 	} else if a.focus == FocusDetailPanel {
@@ -1425,13 +3016,34 @@ func (a *App) renderFooter() string {
 			HelpKeyStyle.Render("r"),
 			HelpKeyStyle.Render("q"))
 	} else {
-		help = fmt.Sprintf("%s nav  %s search  %s filter  %s copy  %s replay  %s quit",
-			HelpKeyStyle.Render("j/k"),
-			HelpKeyStyle.Render("/"),
-			HelpKeyStyle.Render("f"),
-			HelpKeyStyle.Render("c"),
-			HelpKeyStyle.Render("r"),
-			HelpKeyStyle.Render("q"))
+		if a.diffRequestA != nil {
+			// Diff mode: show instruction to select second request
+			help = fmt.Sprintf("%s nav  %s select B for diff  %s cancel diff  %s quit",
+				HelpKeyStyle.Render("j/k"),
+				HelpKeyStyle.Render("d"),
+				HelpKeyStyle.Render("esc"),
+				HelpKeyStyle.Render("q"))
+		} else if a.viewingHistory {
+			help = fmt.Sprintf("%s nav  %s search  %s filter  %s live  %s copy  %s diff  %s quit",
+				HelpKeyStyle.Render("j/k"),
+				HelpKeyStyle.Render("/"),
+				HelpKeyStyle.Render("f"),
+				HelpKeyStyle.Render("h"),
+				HelpKeyStyle.Render("c"),
+				HelpKeyStyle.Render("d"),
+				HelpKeyStyle.Render("q"))
+		} else {
+			help = fmt.Sprintf("%s nav  %s search  %s filter  %s replay  %s replay with edit  %s copy  %s diff  %s history  %s quit",
+				HelpKeyStyle.Render("j/k"),
+				HelpKeyStyle.Render("/"),
+				HelpKeyStyle.Render("f"),
+				HelpKeyStyle.Render("r"),
+				HelpKeyStyle.Render("R"),
+				HelpKeyStyle.Render("c"),
+				HelpKeyStyle.Render("d"),
+				HelpKeyStyle.Render("h"),
+				HelpKeyStyle.Render("q"))
+		}
 	}
 
 	// Add clear hint if filters or search active
@@ -1488,7 +3100,7 @@ func (a *App) updateViewportSize() {
 		if listHeight < 8 {
 			listHeight = 8
 		}
-		detailWidth = a.width - 4               // border + padding
+		detailWidth = a.width - 4 // border + padding
 		detailHeight = contentHeight - listHeight - 2
 	}
 	a.detailViewport = viewport.New(detailWidth, detailHeight)
@@ -1613,6 +3225,46 @@ func (a *App) replayRequest(requestID string) tea.Cmd {
 	return func() tea.Msg {
 		err := a.client.Replay(requestID)
 		return messages.ReplayMsg{RequestID: requestID, Err: err}
+	}
+}
+
+// saveNewRequests saves any new requests to persistent storage
+func (a *App) saveNewRequests() {
+	if a.storage == nil || a.storage.CurrentSessionID() == "" {
+		return
+	}
+
+	for _, req := range a.requests {
+		// Skip if already saved
+		if a.savedReqIDs[req.ID] {
+			continue
+		}
+
+		// Convert to storage format and save
+		histReq := storage.HistoryRequest{
+			ID:         req.ID,
+			SessionID:  a.storage.CurrentSessionID(),
+			Method:     req.Request.Method,
+			Path:       req.Request.URI,
+			StatusCode: req.StatusCode(),
+			DurationMS: req.Duration / 1_000_000, // nanoseconds to milliseconds
+			Timestamp:  req.Start,
+			ReqHeaders: req.Request.Headers,
+			ReqBody:    req.Request.DecodeBody(),
+			ResHeaders: req.Response.Headers,
+			ResBody:    req.Response.DecodeBody(),
+		}
+
+		if err := a.storage.SaveRequest(histReq); err == nil {
+			a.savedReqIDs[req.ID] = true
+		}
+	}
+}
+
+// CloseStorage closes the storage connection
+func (a *App) CloseStorage() {
+	if a.storage != nil {
+		a.storage.Close()
 	}
 }
 
