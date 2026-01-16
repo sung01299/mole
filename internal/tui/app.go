@@ -83,6 +83,10 @@ type App struct {
 	selected       int
 	lastError      error
 	lastSelectedID string // Track selected request ID for viewport updates
+	
+	// Status messages
+	statusMessage     string
+	statusMessageTime time.Time
 
 	// Search (full-text with highlighting)
 	searchQuery  string
@@ -148,6 +152,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case tea.MouseMsg:
+		// Handle mouse wheel scrolling on detail panel regardless of focus
+		if msg.Action == tea.MouseActionPress {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				a.detailViewport.LineUp(3)
+			case tea.MouseButtonWheelDown:
+				a.detailViewport.LineDown(3)
+			}
+		}
+
 	case tea.WindowSizeMsg:
 		a.width = msg.Width
 		a.height = msg.Height
@@ -196,7 +211,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.CopyMsg:
 		if msg.Success {
 			a.lastError = nil
-			// Show brief success message (will be cleared on next action)
+			a.statusMessage = "Copied!"
+			a.statusMessageTime = time.Now()
 		}
 
 	case messages.ErrorMsg:
@@ -339,6 +355,8 @@ func (a *App) handleSearchInput(msg tea.KeyMsg) tea.Cmd {
 		// Clear search completely
 		a.searchQuery = ""
 		a.searchCursor = 0
+		// Force re-render of detail panel to remove highlighting
+		a.lastSelectedID = ""
 		// Reset to show all requests (respecting active filters)
 		a.applyFilters()
 		return nil
@@ -347,6 +365,9 @@ func (a *App) handleSearchInput(msg tea.KeyMsg) tea.Cmd {
 		if len(a.searchQuery) > 0 && a.searchCursor > 0 {
 			a.searchQuery = a.searchQuery[:a.searchCursor-1] + a.searchQuery[a.searchCursor:]
 			a.searchCursor--
+			// Force re-render of detail panel for live highlighting
+			a.lastSelectedID = ""
+			a.updateDetailViewport()
 		}
 		return nil
 
@@ -366,6 +387,9 @@ func (a *App) handleSearchInput(msg tea.KeyMsg) tea.Cmd {
 		char := string(msg.Runes)
 		a.searchQuery = a.searchQuery[:a.searchCursor] + char + a.searchQuery[a.searchCursor:]
 		a.searchCursor += len(char)
+		// Force re-render of detail panel for live highlighting
+		a.lastSelectedID = ""
+		a.updateDetailViewport()
 		return nil
 	}
 	return nil
@@ -535,83 +559,15 @@ func (a *App) getFieldByKey(key string) *FilterField {
 	return nil
 }
 
-// performSearch searches across all requests and filters to matching ones
+// performSearch applies search and resets selection
 func (a *App) performSearch() {
-	if a.searchQuery == "" {
-		// Re-apply filters without search
-		a.applyFilters()
-		return
-	}
-
-	query := strings.ToLower(a.searchQuery)
-
-	// First, filter requests to only those that match
-	var matchingReqs []ngrok.Request
-	matchedIDs := make(map[string]bool)
-
-	// Get base filtered requests (from activeFilters)
-	baseReqs := a.requests
-	if len(a.activeFilters) > 0 {
-		baseReqs = nil
-		for _, req := range a.requests {
-			if a.matchesAllFilters(req) {
-				baseReqs = append(baseReqs, req)
-			}
-		}
-	}
-
-	for _, req := range baseReqs {
-		matched := false
-
-		// Search in method
-		if strings.Contains(strings.ToLower(req.Request.Method), query) {
-			matched = true
-		}
-		// Search in path
-		if strings.Contains(strings.ToLower(req.Request.URI), query) {
-			matched = true
-		}
-		// Search in status
-		if strings.Contains(fmt.Sprintf("%d", req.StatusCode()), query) {
-			matched = true
-		}
-		// Search in headers
-		for k, vals := range req.Request.Headers {
-			for _, v := range vals {
-				if strings.Contains(strings.ToLower(k+": "+v), query) {
-					matched = true
-				}
-			}
-		}
-		for k, vals := range req.Response.Headers {
-			for _, v := range vals {
-				if strings.Contains(strings.ToLower(k+": "+v), query) {
-					matched = true
-				}
-			}
-		}
-		// Search in body
-		reqBody := req.Request.DecodeBody()
-		if strings.Contains(strings.ToLower(reqBody), query) {
-			matched = true
-		}
-		respBody := req.Response.DecodeBody()
-		if strings.Contains(strings.ToLower(respBody), query) {
-			matched = true
-		}
-
-		if matched && !matchedIDs[req.ID] {
-			matchingReqs = append(matchingReqs, req)
-			matchedIDs[req.ID] = true
-		}
-	}
-
-	a.filteredReqs = matchingReqs
 	a.selected = 0
-	a.updateDetailViewport()
+	// Force re-render of detail panel by clearing lastSelectedID
+	a.lastSelectedID = ""
+	a.applyFilters()
 }
 
-// applyFilters applies all active filters to requests
+// applyFilters applies all active filters AND search query to requests
 func (a *App) applyFilters() {
 	// Remember current selection by ID if possible
 	var selectedID string
@@ -619,16 +575,32 @@ func (a *App) applyFilters() {
 		selectedID = a.filteredReqs[a.selected].ID
 	}
 
-	if len(a.activeFilters) == 0 {
-		a.filteredReqs = a.requests
-	} else {
+	// Start with all requests
+	baseReqs := a.requests
+
+	// Apply active filters first
+	if len(a.activeFilters) > 0 {
 		var filtered []ngrok.Request
-		for _, req := range a.requests {
+		for _, req := range baseReqs {
 			if a.matchesAllFilters(req) {
 				filtered = append(filtered, req)
 			}
 		}
+		baseReqs = filtered
+	}
+
+	// Then apply search query if present
+	if a.searchQuery != "" {
+		query := strings.ToLower(a.searchQuery)
+		var filtered []ngrok.Request
+		for _, req := range baseReqs {
+			if a.matchesSearch(req, query) {
+				filtered = append(filtered, req)
+			}
+		}
 		a.filteredReqs = filtered
+	} else {
+		a.filteredReqs = baseReqs
 	}
 
 	// Try to restore selection by ID
@@ -647,6 +619,47 @@ func (a *App) applyFilters() {
 		a.selected = max(0, len(a.filteredReqs)-1)
 	}
 	a.updateDetailViewport()
+}
+
+// matchesSearch checks if a request matches the search query
+func (a *App) matchesSearch(req ngrok.Request, query string) bool {
+	// Search in method
+	if strings.Contains(strings.ToLower(req.Request.Method), query) {
+		return true
+	}
+	// Search in path
+	if strings.Contains(strings.ToLower(req.Request.URI), query) {
+		return true
+	}
+	// Search in status
+	if strings.Contains(fmt.Sprintf("%d", req.StatusCode()), query) {
+		return true
+	}
+	// Search in headers
+	for k, vals := range req.Request.Headers {
+		for _, v := range vals {
+			if strings.Contains(strings.ToLower(k+": "+v), query) {
+				return true
+			}
+		}
+	}
+	for k, vals := range req.Response.Headers {
+		for _, v := range vals {
+			if strings.Contains(strings.ToLower(k+": "+v), query) {
+				return true
+			}
+		}
+	}
+	// Search in body
+	reqBody := req.Request.DecodeBody()
+	if strings.Contains(strings.ToLower(reqBody), query) {
+		return true
+	}
+	respBody := req.Response.DecodeBody()
+	if strings.Contains(strings.ToLower(respBody), query) {
+		return true
+	}
+	return false
 }
 
 // matchesAllFilters checks if a request matches all active filters
@@ -741,13 +754,21 @@ func (a *App) clearAll() {
 	a.activeFilters = nil
 	a.filteredReqs = a.requests
 	a.selected = 0
+	// Force re-render to remove highlighting
+	a.lastSelectedID = ""
 	a.updateDetailViewport()
 }
 
 // copyAsCurl copies the request as a cURL command to clipboard
 func (a *App) copyAsCurl(req ngrok.Request) tea.Cmd {
+	// Get the base URL from tunnels
+	baseURL := ""
+	if len(a.tunnels) > 0 {
+		baseURL = a.tunnels[0].PublicURL
+	}
+	
 	return func() tea.Msg {
-		curl := buildCurlCommand(req)
+		curl := buildCurlCommand(req, baseURL)
 		
 		// Try to copy to clipboard using system command
 		var cmd *exec.Cmd
@@ -770,7 +791,7 @@ func (a *App) copyAsCurl(req ngrok.Request) tea.Cmd {
 }
 
 // buildCurlCommand builds a cURL command string from a request
-func buildCurlCommand(req ngrok.Request) string {
+func buildCurlCommand(req ngrok.Request, baseURL string) string {
 	var parts []string
 	parts = append(parts, "curl")
 
@@ -779,12 +800,15 @@ func buildCurlCommand(req ngrok.Request) string {
 		parts = append(parts, "-X", req.Request.Method)
 	}
 
-	// Headers
+	// Headers (skip internal/automatic headers)
 	for key, values := range req.Request.Headers {
-		// Skip some headers that curl handles automatically
-		if strings.ToLower(key) == "host" ||
-			strings.ToLower(key) == "content-length" ||
-			strings.HasPrefix(strings.ToLower(key), "x-forwarded") {
+		lowerKey := strings.ToLower(key)
+		// Skip headers that curl handles automatically or are ngrok-specific
+		if lowerKey == "host" ||
+			lowerKey == "content-length" ||
+			lowerKey == "accept-encoding" ||
+			lowerKey == "user-agent" ||
+			strings.HasPrefix(lowerKey, "x-forwarded") {
 			continue
 		}
 		for _, v := range values {
@@ -800,8 +824,9 @@ func buildCurlCommand(req ngrok.Request) string {
 		parts = append(parts, "-d", fmt.Sprintf("'%s'", body))
 	}
 
-	// URL (use a placeholder since we don't have the full URL)
-	parts = append(parts, fmt.Sprintf("'<URL>%s'", req.Request.URI))
+	// Full URL
+	fullURL := baseURL + req.Request.URI
+	parts = append(parts, fmt.Sprintf("'%s'", fullURL))
 
 	return strings.Join(parts, " ")
 }
@@ -1311,6 +1336,8 @@ func indentLines(text, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
+
+
 // renderHeaders renders headers in sorted order to prevent flickering
 func (a *App) renderHeaders(headers map[string][]string) string {
 	if len(headers) == 0 {
@@ -1426,6 +1453,18 @@ func (a *App) renderFooter() string {
 		footer = errMsg + footer
 	}
 
+	// Add status message (e.g., "Copied!") - show for 1 second
+	if a.statusMessage != "" && time.Since(a.statusMessageTime) < 1*time.Second {
+		statusMsg := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#10B981")).
+			Bold(true).
+			Render(a.statusMessage + "  ")
+		footer = statusMsg + footer
+	} else if a.statusMessage != "" {
+		// Clear expired message
+		a.statusMessage = ""
+	}
+
 	return HelpStyle.Width(a.width).Padding(0, 1).Render(footer)
 }
 
@@ -1472,9 +1511,80 @@ func (a *App) updateDetailViewport() {
 	if req.ID != a.lastSelectedID {
 		a.lastSelectedID = req.ID
 		content := a.renderRequestDetail(req, a.detailViewport.Width, a.detailViewport.Height, false)
+		// Use lipgloss to wrap content to viewport width
+		content = lipgloss.NewStyle().Width(a.detailViewport.Width).Render(content)
 		a.detailViewport.SetContent(content)
-		a.detailViewport.GotoTop()
+
+		// If search is active, scroll to first match
+		if a.searchQuery != "" {
+			a.scrollToFirstMatch(req)
+		} else {
+			a.detailViewport.GotoTop()
+		}
 	}
+}
+
+// scrollToFirstMatch scrolls the detail viewport to the first occurrence of the search query
+func (a *App) scrollToFirstMatch(req ngrok.Request) {
+	query := strings.ToLower(a.searchQuery)
+
+	// Build a simplified version of the content to find line numbers
+	var lines []string
+	lines = append(lines, req.Request.Method+" "+req.Request.URI) // Line 0-1: title
+	lines = append(lines, "")
+	lines = append(lines, fmt.Sprintf("%d %s", req.StatusCode(), httpStatusText(req.StatusCode()))) // Status
+	lines = append(lines, fmt.Sprintf("%.2fms", req.DurationMs()))                                  // Duration
+	lines = append(lines, req.Start.Format("2006-01-02 15:04:05"))                                  // Time
+	lines = append(lines, "")
+	lines = append(lines, "Request Headers:")
+
+	// Request headers
+	for k, vals := range req.Request.Headers {
+		for _, v := range vals {
+			lines = append(lines, k+": "+v)
+		}
+	}
+
+	// Request body
+	reqBody := req.Request.DecodeBody()
+	if reqBody != "" {
+		lines = append(lines, "")
+		lines = append(lines, "Request Body:")
+		bodyLines := strings.Split(reqBody, "\n")
+		lines = append(lines, bodyLines...)
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, "Response Headers:")
+
+	// Response headers
+	for k, vals := range req.Response.Headers {
+		for _, v := range vals {
+			lines = append(lines, k+": "+v)
+		}
+	}
+
+	// Response body
+	respBody := req.Response.DecodeBody()
+	if respBody != "" {
+		lines = append(lines, "")
+		lines = append(lines, "Response Body:")
+		bodyLines := strings.Split(respBody, "\n")
+		lines = append(lines, bodyLines...)
+	}
+
+	// Find first line with match
+	for i, line := range lines {
+		if strings.Contains(strings.ToLower(line), query) {
+			// Scroll to this line (with some padding above)
+			targetLine := max(0, i-2)
+			a.detailViewport.SetYOffset(targetLine)
+			return
+		}
+	}
+
+	// No match found in simplified content, go to top
+	a.detailViewport.GotoTop()
 }
 
 // Command helpers
